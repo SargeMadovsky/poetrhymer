@@ -8,9 +8,12 @@ use std::{
 
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
 
-use crate::{core, lexicon::Lexicon, storage};
+use crate::{core, formatter, lexicon::Lexicon, storage};
 
 const SAMPLE: &str = "[Куплет 1]\n«Где ты был, Семён Петрович?»\nТот ответил не спеша:\n«Поле было. Я работал.\nЗаготовил фуража».\n";
+const FORMAT_DRAFT: &str = "# «Тракторист Семён Петров»\n\n**Куплет 1**\nНа рассвете над **полями**  \nИ выходит вместе с *нами*\\\n\n***Припев***\nПой!\n";
+const FORMATTED_DRAFT: &str =
+    "[Куплет 1]\nНа рассвете над полями\nИ выходит вместе с нами\n\n[Припев]\nПой!\n";
 const ACCENT: Color32 = Color32::from_rgb(238, 185, 104);
 const MUTED: Color32 = Color32::from_rgb(142, 156, 176);
 const INK: Color32 = Color32::from_rgb(222, 230, 241);
@@ -35,13 +38,22 @@ enum PendingAction {
     Close,
 }
 
+#[derive(Clone)]
+struct DocumentState {
+    text: String,
+    title: Option<String>,
+    rhyme_links: Vec<core::RhymeLink>,
+}
+
 pub struct PoetApp {
     text: String,
     saved_text: String,
+    saved_title: Option<String>,
+    document_title: Option<String>,
     file_path: Option<PathBuf>,
     revision: u64,
-    undo: Vec<String>,
-    redo: Vec<String>,
+    undo: Vec<DocumentState>,
+    redo: Vec<DocumentState>,
     last_typing: Option<Instant>,
     selection: Option<Selection>,
     anchor: String,
@@ -94,6 +106,7 @@ impl PoetApp {
         let default_folder = storage::default_dictionary_folder();
         let mut session = recovery.unwrap_or_else(|| storage::Session {
             text: SAMPLE.to_owned(),
+            document_title: None,
             dictionary_folder: default_folder.to_string_lossy().into_owned(),
             rhyme_links: Vec::new(),
         });
@@ -113,6 +126,12 @@ impl PoetApp {
             } else {
                 session.text.clone()
             },
+            saved_title: if recovered {
+                None
+            } else {
+                session.document_title.clone()
+            },
+            document_title: session.document_title,
             text: session.text,
             file_path: None,
             revision: 0,
@@ -229,7 +248,7 @@ impl PoetApp {
     }
 
     fn is_dirty(&self) -> bool {
-        self.text != self.saved_text
+        self.text != self.saved_text || self.document_title != self.saved_title
     }
 
     fn load_dictionary(&mut self, ctx: &egui::Context) {
@@ -413,7 +432,41 @@ impl PoetApp {
         self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
     }
 
-    fn push_undo(&mut self, previous: String) {
+    fn snapshot(&self) -> DocumentState {
+        DocumentState {
+            text: self.text.clone(),
+            title: self.document_title.clone(),
+            rhyme_links: self.rhyme_links.clone(),
+        }
+    }
+
+    fn restore_snapshot(&mut self, state: DocumentState) {
+        self.text = state.text;
+        self.document_title = state.title;
+        self.rhyme_links = state.rhyme_links;
+    }
+
+    fn format_document(&mut self) {
+        let formatted = formatter::format_paste(&self.text, true);
+        let title = formatted.title.or_else(|| self.document_title.clone());
+        if formatted.text == self.text && title == self.document_title {
+            self.set_status("Текст уже в обычном формате", false);
+            return;
+        }
+        let previous = self.snapshot();
+        self.text = formatted.text;
+        self.document_title = title;
+        self.push_undo(previous);
+        self.last_typing = None;
+        self.after_document_change();
+        self.requested_cursor = Some(0);
+        self.set_status(
+            "Markdown преобразован в обычный текст. Ctrl+Z — отменить.",
+            false,
+        );
+    }
+
+    fn push_undo(&mut self, previous: DocumentState) {
         self.undo.push(previous);
         if self.undo.len() > 150 {
             self.undo.remove(0);
@@ -423,7 +476,9 @@ impl PoetApp {
 
     fn undo(&mut self) {
         if let Some(previous) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.text, previous));
+            let current = self.snapshot();
+            self.redo.push(current);
+            self.restore_snapshot(previous);
             self.last_typing = None;
             self.after_document_change();
             self.set_status("Изменение отменено", false);
@@ -432,7 +487,9 @@ impl PoetApp {
 
     fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.text, next));
+            let current = self.snapshot();
+            self.undo.push(current);
+            self.restore_snapshot(next);
             self.last_typing = None;
             self.after_document_change();
             self.set_status("Изменение повторено", false);
@@ -464,7 +521,8 @@ impl PoetApp {
         let anchor_line = self.anchor_line;
         match core::replace_word(&self.text, selection.span.clone(), &new_word) {
             Ok(text) => {
-                let previous = std::mem::replace(&mut self.text, text);
+                let previous = self.snapshot();
+                self.text = text;
                 self.push_undo(previous);
                 self.last_typing = None;
                 self.after_document_change();
@@ -486,6 +544,7 @@ impl PoetApp {
     }
 
     fn save(&mut self, save_as: bool) -> bool {
+        let default_filename = formatter::suggested_filename(self.document_title.as_deref());
         let path = if save_as || self.file_path.is_none() {
             rfd::FileDialog::new()
                 .add_filter("Текст UTF-8", &["txt"])
@@ -494,7 +553,7 @@ impl PoetApp {
                         .as_ref()
                         .and_then(|path| path.file_name())
                         .and_then(|name| name.to_str())
-                        .unwrap_or("Мой текст.txt"),
+                        .unwrap_or(default_filename.as_str()),
                 )
                 .save_file()
         } else {
@@ -505,6 +564,7 @@ impl PoetApp {
             Ok(()) => {
                 self.file_path = Some(path);
                 self.saved_text = self.text.clone();
+                self.saved_title = self.document_title.clone();
                 self.set_status("Текст сохранён", false);
                 true
             }
@@ -539,6 +599,8 @@ impl PoetApp {
 
     fn replace_document(&mut self, text: String, path: Option<PathBuf>) {
         self.rhyme_links.clear();
+        self.document_title = None;
+        self.saved_title = None;
         self.text = text;
         self.saved_text = self.text.clone();
         self.file_path = path;
@@ -574,14 +636,32 @@ impl PoetApp {
                     );
                     ui.add_space(18.0);
                     let name = self
-                        .file_path
-                        .as_ref()
-                        .and_then(|path| path.file_name())
-                        .map(|name| name.to_string_lossy().into_owned())
+                        .document_title
+                        .clone()
+                        .or_else(|| {
+                            self.file_path
+                                .as_ref()
+                                .and_then(|path| path.file_name())
+                                .map(|name| name.to_string_lossy().into_owned())
+                        })
                         .unwrap_or_else(|| "Новый текст".into());
-                    ui.label(
-                        RichText::new(format!("{name}{}", if self.is_dirty() { " •" } else { "" }))
-                            .color(MUTED),
+                    let title_width = (ui.available_width() - 550.0).clamp(100.0, 420.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(title_width, 30.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "{name}{}",
+                                        if self.is_dirty() { " •" } else { "" }
+                                    ))
+                                    .color(MUTED),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&name);
+                        },
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0);
@@ -827,6 +907,9 @@ impl PoetApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("ВАШ ТЕКСТ").size(11.0).strong().color(MUTED));
+                    if ui.small_button("Форматировать").on_hover_text("Убрать Markdown, вынести # название в верхнюю панель и оформить секции в [скобках]").clicked() {
+                        self.format_document();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new("Последние слова — точки для новых рифм")
@@ -848,7 +931,58 @@ impl PoetApp {
                     }
                     ui.memory_mut(|memory| memory.request_focus(editor_id));
                 }
-                let previous = self.text.clone();
+                let previous = self.snapshot();
+                if self.smoke_test && matches!(self.smoke_stage, 6 | 8 | 10) {
+                    let mut state = egui::TextEdit::load_state(ctx, editor_id).unwrap_or_default();
+                    let count = self.text.chars().count();
+                    let range = if self.smoke_stage == 6 {
+                        egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(count),
+                        )
+                    } else {
+                        let at = if self.smoke_stage == 10 { core::byte_to_char(&self.text,self.text.find("полями").unwrap()) } else { count };
+                        egui::text::CCursorRange::one(egui::text::CCursor::new(at))
+                    };
+                    state.cursor.set_char_range(Some(range));
+                    state.store(ctx, editor_id);
+                    ui.memory_mut(|memory| memory.request_focus(editor_id));
+                    let draft = if self.smoke_stage == 6 {
+                        FORMAT_DRAFT
+                    } else if self.smoke_stage == 8 {
+                        "\n# Бридж\nТихо\n"
+                    } else { "**тихими** " };
+                    ctx.input_mut(|input| input.events.push(egui::Event::Paste(draft.into())));
+                    self.smoke_stage += 1;
+                }
+                let mut pasted = false;
+                if ui.memory(|memory| memory.has_focus(editor_id)) {
+                    let range = egui::TextEdit::load_state(ctx, editor_id)
+                        .and_then(|state| state.cursor.char_range())
+                        .map(|range| range.primary.index.min(range.secondary.index)..range.primary.index.max(range.secondary.index));
+                    let replaces_all = self.text.trim().is_empty() || range.as_ref()
+                        .is_some_and(|range| range.start == 0 && range.end == self.text.chars().count());
+                    let inline_position = range.as_ref().is_some_and(|range| {
+                        let start = core::char_to_byte(&self.text, range.start);
+                        let end = core::char_to_byte(&self.text, range.end);
+                        !self.text[..start].rsplit('\n').next().unwrap_or("").trim().is_empty()
+                            || !self.text[end..].split('\n').next().unwrap_or("").trim().is_empty()
+                    });
+                    let mut title = None;
+                    ctx.input_mut(|input| {
+                        for event in &mut input.events {
+                            if let egui::Event::Paste(contents) = event {
+                                let formatted = if inline_position && !contents.contains(['\n', '\r']) {
+                                    formatter::FormattedPaste {text: formatter::format_inline(contents), title:None}
+                                } else { formatter::format_paste(contents, replaces_all && title.is_none()) };
+                                *contents = formatted.text;
+                                if formatted.title.is_some() { title = formatted.title; }
+                                pasted = true;
+                            }
+                        }
+                    });
+                    if let Some(title) = title { self.document_title = Some(title); }
+                }
                 let selected = self
                     .selection
                     .as_ref()
@@ -881,9 +1015,9 @@ impl PoetApp {
                             }
                         }
                     });
-                if changed {
+                if changed || self.document_title != previous.title {
                     let now = Instant::now();
-                    let coalesce = self
+                    let coalesce = !pasted && self
                         .last_typing
                         .is_some_and(|last| now.duration_since(last) < Duration::from_millis(650));
                     if !coalesce {
@@ -891,7 +1025,7 @@ impl PoetApp {
                     } else {
                         self.redo.clear();
                     }
-                    self.last_typing = Some(now);
+                    self.last_typing = if pasted { None } else { Some(now) };
                     self.after_document_change();
                 }
                 if let Some(character) = clicked_position {
@@ -1023,6 +1157,24 @@ impl PoetApp {
                 finish(ctx, Err("багажа missing from candidates".into()));
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
+            if std::env::args().any(|arg| arg == "--smoke-formatter") {
+                self.replace_document(FORMAT_DRAFT.into(), None);
+                self.format_document();
+                if self.text != FORMATTED_DRAFT
+                    || self.document_title.as_deref() != Some("«Тракторист Семён Петров»")
+                {
+                    finish(ctx, Err("format button mismatch".into()));
+                    return;
+                }
+                self.undo();
+                if self.text != FORMAT_DRAFT || self.document_title.is_some() {
+                    finish(ctx, Err("format button undo mismatch".into()));
+                    return;
+                }
+                self.replace_document("Старый текст".into(), None);
+                self.smoke_stage = 6;
+                return;
+            }
             if std::env::args().any(|arg| arg == "--smoke-stanzas") {
                 self.replace_document("# Тракторист Семён Петров\n\n**Куплет 1**\nНа рассвете над полями\nПоднимается туман,\nИ выходит вместе с нами\nНа работу ветеран.\n\n[Припев]\nЗдесь другая строка\n".into(), None);
                 let target = self.text.find("полями").unwrap();
@@ -1057,11 +1209,82 @@ impl PoetApp {
             self.set_status("Проверено: словарь, поиск, замена, отмена и повтор.", false);
             self.smoke_started = Instant::now();
             self.smoke_stage = 2;
+        } else if self.smoke_stage == 7 {
+            if self.text != FORMATTED_DRAFT
+                || self.document_title.as_deref() != Some("«Тракторист Семён Петров»")
+                || self.undo.len() != 1
+            {
+                finish(ctx, Err("paste formatting/title/history mismatch".into()));
+                return;
+            }
+            self.undo();
+            if self.text != "Старый текст" || self.document_title.is_some() {
+                finish(ctx, Err("paste undo did not restore document title".into()));
+                return;
+            }
+            self.redo();
+            if self.text != FORMATTED_DRAFT
+                || self.document_title.as_deref() != Some("«Тракторист Семён Петров»")
+            {
+                finish(ctx, Err("paste redo mismatch".into()));
+                return;
+            }
+            let session = storage::Session {
+                text: self.text.clone(),
+                document_title: self.document_title.clone(),
+                dictionary_folder: self.dictionary_folder.clone(),
+                rhyme_links: self.rhyme_links.clone(),
+            };
+            let restored: storage::Session =
+                serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+            if restored.text != self.text || restored.document_title != self.document_title {
+                finish(ctx, Err("title recovery mismatch".into()));
+                return;
+            }
+            self.requested_cursor = Some(self.text.chars().count());
+            self.smoke_stage = 8;
+        } else if self.smoke_stage == 9 {
+            if !self.text.ends_with("\n[Бридж]\nТихо\n")
+                || self.document_title.as_deref() != Some("«Тракторист Семён Петров»")
+            {
+                finish(
+                    ctx,
+                    Err("fragment paste renamed the document or retained Markdown".into()),
+                );
+                return;
+            }
+            self.undo();
+            if self.text != FORMATTED_DRAFT {
+                finish(ctx, Err("fragment paste was not one undo action".into()));
+                return;
+            }
+            self.smoke_stage = 10;
+        } else if self.smoke_stage == 11 {
+            if !self.text.contains("над тихими полями")
+                || self.text.contains("[тихими]")
+                || self.document_title.as_deref() != Some("«Тракторист Семён Петров»")
+            {
+                finish(ctx, Err("inline paste was treated as a section".into()));
+                return;
+            }
+            self.undo();
+            if self.text != FORMATTED_DRAFT {
+                finish(ctx, Err("inline paste undo mismatch".into()));
+                return;
+            }
+            self.select_word(self.text.find("полями").unwrap());
+            self.smoke_stage = 5;
         } else if self.smoke_stage == 5 && !self.search_loading && self.search_due.is_none() {
             self.set_status(
                 "Проверено: Markdown, строфы, опора «нами», ручной выбор и возврат в авто.",
                 false,
             );
+            if std::env::args().any(|arg| arg == "--smoke-formatter") {
+                self.set_status(
+                    "Проверено: вставка Markdown, название документа, отмена и повтор.",
+                    false,
+                );
+            }
             self.smoke_started = Instant::now();
             self.smoke_stage = 2;
         } else if self.smoke_stage == 2 && self.smoke_started.elapsed() > Duration::from_millis(400)
@@ -1106,6 +1329,7 @@ impl eframe::App for PoetApp {
         self.receive_background();
         if ctx.input(|input| input.viewport().close_requested())
             && !self.allow_close
+            && !self.smoke_test
             && self.is_dirty()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1144,6 +1368,7 @@ impl eframe::App for PoetApp {
             self.autosave_due = None;
             if let Err(error) = storage::save_recovery(&storage::Session {
                 text: self.text.clone(),
+                document_title: self.document_title.clone(),
                 dictionary_folder: self.dictionary_folder.clone(),
                 rhyme_links: self.rhyme_links.clone(),
             }) {
@@ -1211,6 +1436,7 @@ impl eframe::App for PoetApp {
         }
         let _ = storage::save_recovery(&storage::Session {
             text: self.text.clone(),
+            document_title: self.document_title.clone(),
             dictionary_folder: self.dictionary_folder.clone(),
             rhyme_links: self.rhyme_links.clone(),
         });

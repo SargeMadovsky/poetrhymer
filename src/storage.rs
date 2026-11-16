@@ -7,6 +7,8 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub text: String,
+    #[serde(default)]
+    pub document_title: Option<String>,
     pub dictionary_folder: String,
     #[serde(default)]
     pub rhyme_links: Vec<crate::core::RhymeLink>,
@@ -108,6 +110,7 @@ mod tests {
         let session: Session =
             serde_json::from_str(r#"{"text":"строка","dictionary_folder":"Rhymes 3"}"#).unwrap();
         assert!(session.rhyme_links.is_empty());
+        assert!(session.document_title.is_none());
     }
     #[test]
     fn save_twice_preserves_previous_file_and_utf8() {
