@@ -42,6 +42,11 @@ pub struct Analysis {
 pub fn is_vowel(c: char) -> bool {
     "аеёиоуыэюяАЕЁИОУЫЭЮЯ".contains(c)
 }
+/// Visible accent marks are unnecessary on monosyllables and words containing ё.
+pub fn needs_mark(word: &str) -> bool {
+    core::syllables(word) > 1 && !word.contains(['ё', 'Ё'])
+}
+
 pub fn clean(word: &str) -> String {
     word.chars().filter(|c| *c != '\u{301}').collect()
 }
@@ -248,7 +253,7 @@ pub fn export(text: &str, analysis: &Analysis) -> String {
         }
         out.push_str(&text[cursor..token.span.start]);
         match token.selected {
-            Some(vowel) if !token.word.contains('\u{301}') => {
+            Some(vowel) if needs_mark(&token.word) && !token.word.contains('\u{301}') => {
                 out.push_str(&accented(&token.word, vowel))
             }
             _ => out.push_str(&token.word),
@@ -286,7 +291,7 @@ mod tests {
         assert_eq!(analysis.tokens[1].selected, Some(2));
         assert_eq!(
             export(text, &analysis),
-            "[Куплет 1]\nЗАМОК, облаче́нный!\nЁлочка и́ абракадабра.\n"
+            "[Куплет 1]\nЗАМОК, облаче́нный!\nЁлочка и абракадабра.\n"
         );
         assert!(text.contains("облаченный"));
     }
@@ -326,6 +331,27 @@ mod tests {
         rebase(&shifted, &changed, &mut marks);
         assert!(marks.is_empty());
     }
+    #[test]
+    fn copying_omits_unnecessary_marks_but_keeps_user_written_accents() {
+        let text = "Дом и ёлочка, ВСЁ, за́мок, замок и фыжобряк.";
+        let analysis = analyze(text, &[], Some(&lexicon()));
+        assert_eq!(export(text, &analysis), text);
+        assert!(!needs_mark("Дом"));
+        assert!(!needs_mark("ёлочка"));
+        assert!(!needs_mark("ВСЁ"));
+        assert!(needs_mark("за́мок"));
+        let manual = analyze(
+            "И замок",
+            &[Mark {
+                start: "И ".len(),
+                word: "замок".into(),
+                vowel: Some(1),
+            }],
+            None,
+        );
+        assert_eq!(export("И замок", &manual), "И замо́к");
+    }
+
     #[test]
     fn malformed_marks_and_heading_marks_are_rejected() {
         let text = "[Замок]\nЗамок";
