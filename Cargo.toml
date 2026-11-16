@@ -1,6 +1,6 @@
 [package]
 name = "poetrhymer"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 default-run = "poetrhymer"
 description = "Локальный редактор стихов и песен"
@@ -21,6 +21,9 @@ hex = "0.4"
 semver = "1"
 self-replace = "1.5"
 tempfile = "3"
+
+[build-dependencies]
+winresource = "0.1.34"
 
 [profile.release]
 opt-level = 2

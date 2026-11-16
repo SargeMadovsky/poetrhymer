@@ -13,3 +13,5 @@ jobs:
         run: cargo test --locked
       - name: Build
         run: cargo build --release --locked --bin poetrhymer
+      - name: Verify Windows icon and version resources
+        run: python tools/verify_windows_icon.py target/release/poetrhymer.exe

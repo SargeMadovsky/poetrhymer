@@ -21,6 +21,7 @@ UninstallDisplayIcon={app}\Poetrhymer.exe
 CloseApplications=yes
 RestartApplications=no
 SetupMutex=PoetrhymerSetup
+SetupIconFile=..\assets\icon\poetrhymer.ico
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
