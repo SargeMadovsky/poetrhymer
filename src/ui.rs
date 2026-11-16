@@ -68,6 +68,8 @@ pub struct PoetApp {
     rhyme_links: Vec<core::RhymeLink>,
     match_syllables: bool,
     closer_only: bool,
+    compact_rhymes: bool,
+    reveal_candidate: bool,
     syllable_count: usize,
     part_of_speech: String,
     candidates: Vec<core::Candidate>,
@@ -121,6 +123,7 @@ impl PoetApp {
             rhyme_links: Vec::new(),
             last_document_folder: None,
             file_path: None,
+            compact_rhymes: false,
         });
         let history_temp =
             smoke_test.then(|| tempfile::tempdir().expect("smoke-test history directory"));
@@ -183,6 +186,8 @@ impl PoetApp {
             rhyme_links: session.rhyme_links,
             match_syllables: true,
             closer_only: false,
+            compact_rhymes: session.compact_rhymes,
+            reveal_candidate: false,
             syllable_count: 3,
             part_of_speech: String::new(),
             candidates: Vec::new(),
@@ -246,6 +251,7 @@ impl PoetApp {
             rhyme_links: self.rhyme_links.clone(),
             last_document_folder: self.last_document_folder.clone(),
             file_path: self.file_path.clone(),
+            compact_rhymes: self.compact_rhymes,
         }
     }
 
@@ -1071,7 +1077,8 @@ impl PoetApp {
                 ui.label(RichText::new(&selection.word).size(18.0).color(ACCENT).strong());
             });
             let line_syllables = core::parse_lines(&self.text).get(selection.line).map_or(0, |line| line.syllables);
-            ui.label(RichText::new(format!("{} · {} слогов", core::line_label(&self.text, selection.line), line_syllables)).color(MUTED).size(12.0));
+            ui.label(RichText::new(core::line_label(&self.text, selection.line)).color(MUTED).size(12.0));
+            ui.label(RichText::new(format!("Слоги: в слове {} · в строке {}", core::syllables(&selection.word), line_syllables)).color(MUTED).size(12.0));
             let selected_line = selection.line;
             ui.add_space(15.0);
             let manual = self.rhyme_links.iter().any(|link| link.target == selected_line);
@@ -1138,7 +1145,7 @@ impl PoetApp {
             ui.add_space(12.0);
             let mut filter_changed = false;
             ui.horizontal(|ui| {
-                filter_changed |= ui.checkbox(&mut self.match_syllables, "Слогов").changed();
+                filter_changed |= ui.checkbox(&mut self.match_syllables, "Слогов в слове").on_hover_text("Число слогов в варианте замены. Изначально берётся из заменяемого слова.").changed();
                 filter_changed |= ui.add_enabled(self.match_syllables, egui::DragValue::new(&mut self.syllable_count).range(1..=20)).changed();
             });
             egui::ComboBox::from_id_salt("part_of_speech")
@@ -1172,35 +1179,129 @@ impl PoetApp {
             } else {
                 ui.label(RichText::new(format!("Варианты · {}{}", visible_count, if self.candidates.len() == 150 { " из первых 150" } else { "" })).size(12.0).color(MUTED));
             }
-            let list_height = (ui.available_height() - 130.0).max(70.0);
-            egui::ScrollArea::vertical().id_salt("rhyme_results").max_height(list_height).show(ui, |ui| {
-                for (index, candidate) in self.candidates.iter().enumerate() {
-                    if self.closer_only && candidate.score < 120 { continue; }
-                    let response = ui.add_sized([ui.available_width(), 32.0], egui::Button::new(
-                        RichText::new(&candidate.stressed).size(17.0)
-                    ).selected(self.chosen == Some(index)));
-                    response.clone().on_hover_text(format!("{} слогов · {}", candidate.syllables, candidate.part_of_speech));
-                    if response.clicked() { self.chosen = Some(index); }
-                }
+            self.rhyme_results(ui, ctx);
+        });
+    }
+
+    fn rhyme_results(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let old_view = self.compact_rhymes;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.compact_rhymes, false, "Список");
+            ui.selectable_value(&mut self.compact_rhymes, true, "Компактно")
+                .on_hover_text("Плотный массив слов с переносом по ширине панели");
+        });
+        if old_view != self.compact_rhymes {
+            self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+            self.reveal_candidate = true;
+        }
+        let preview = self
+            .chosen
+            .and_then(|index| self.candidates.get(index))
+            .and_then(|candidate| {
+                self.selection.as_ref().and_then(|selection| {
+                    core::replace_word(&self.text, selection.span.clone(), &candidate.word)
+                        .ok()
+                        .and_then(|text| {
+                            core::parse_lines(&text)
+                                .get(selection.line)
+                                .map(|line| text[line.span.clone()].trim().to_owned())
+                        })
+                })
             });
-            if let Some(candidate) = self.chosen.and_then(|index| self.candidates.get(index)) {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(RichText::new("ПРЕДПРОСМОТР").size(10.0).color(MUTED));
-                if let Some(selection) = &self.selection {
-                    if let Ok(preview) = core::replace_word(&self.text, selection.span.clone(), &candidate.word) {
-                        if let Some(line) = core::parse_lines(&preview).iter().find(|line| line.index == selection.line) {
-                            ui.label(RichText::new(preview[line.span.clone()].trim()).size(17.0).color(ACCENT));
+        // Measure and allocate the real footer first; no empty fixed-height reserve.
+        if let Some(preview) = preview {
+            egui::TopBottomPanel::bottom("rhyme_preview_footer")
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(ui.visuals().panel_fill)
+                        .inner_margin(egui::Margin::symmetric(0, 8)),
+                )
+                .show_separator_line(true)
+                .show_inside(ui, |ui| {
+                    ui.label(RichText::new("ПРЕДПРОСМОТР").size(10.0).color(MUTED));
+                    egui::ScrollArea::vertical()
+                        .id_salt("rhyme_preview_text")
+                        .max_height(80.0)
+                        .min_scrolled_height(0.0)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&preview).size(17.0).color(ACCENT));
+                        });
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 36.0],
+                            egui::Button::new("Заменить слово").fill(Color32::from_rgb(85, 66, 40)),
+                        )
+                        .clicked()
+                    {
+                        self.apply_candidate();
+                    }
+                });
+        }
+        let compact = self.compact_rhymes;
+        let reveal = std::mem::take(&mut self.reveal_candidate);
+        egui::ScrollArea::vertical()
+            .id_salt(("rhyme_results", compact))
+            .auto_shrink([false, false])
+            .min_scrolled_height(0.0)
+            .max_height(ui.available_height().max(1.0))
+            .show(ui, |ui| {
+                let mut render = |ui: &mut egui::Ui| {
+                    for (index, candidate) in self.candidates.iter().enumerate() {
+                        if self.closer_only && candidate.score < 120 {
+                            continue;
+                        }
+                        let selected = self.chosen == Some(index);
+                        let response = if compact {
+                            // Lay out each complete word before flowing the buttons, so a
+                            // narrow remainder never turns a word into a vertical column.
+                            let width = (ui.max_rect().width() - 12.0).max(1.0);
+                            let galley = ui.fonts(|fonts| {
+                                fonts.layout(
+                                    candidate.stressed.clone(),
+                                    FontId::proportional(15.0),
+                                    INK,
+                                    width,
+                                )
+                            });
+                            ui.add(
+                                egui::Button::new(galley)
+                                    .min_size(egui::vec2(24.0, 28.0))
+                                    .selected(selected),
+                            )
+                        } else {
+                            ui.add_sized(
+                                [ui.available_width(), 32.0],
+                                egui::Button::new(RichText::new(&candidate.stressed).size(17.0))
+                                    .wrap()
+                                    .selected(selected),
+                            )
+                        }
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(format!(
+                            "{} · {} слогов · {}",
+                            candidate.stressed, candidate.syllables, candidate.part_of_speech
+                        ));
+                        if selected && reveal {
+                            response.scroll_to_me(None);
+                        }
+                        if response.clicked() {
+                            self.chosen = Some(index);
+                            self.reveal_candidate = true;
+                            ctx.request_repaint();
                         }
                     }
+                };
+                if compact {
+                    ui.scope(|ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        ui.horizontal_wrapped(&mut render);
+                    });
+                } else {
+                    render(ui);
                 }
-                ui.add_space(8.0);
-                if ui.add_sized([ui.available_width(), 36.0], egui::Button::new("Заменить слово").fill(Color32::from_rgb(85, 66, 40))).clicked() {
-                    self.apply_candidate();
-                }
-            }
-        });
+            });
     }
 
     fn editor(&mut self, ctx: &egui::Context) {
@@ -1610,6 +1711,18 @@ impl PoetApp {
                 finish(ctx, Err("багажа missing from candidates".into()));
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
+            if std::env::args().any(|arg| arg == "--smoke-rhymes-syllables") {
+                self.replace_document("[Куплет 1]\nНе министр, не учёный,\nНе артист и не пилот —\nВ серый ватник облачённый\nТракторист Семён Петров.\n".into(), None);
+                self.select_word(self.text.find("облачённый").unwrap());
+                let line = self.selection.as_ref().unwrap().line;
+                if self.syllable_count != 4 || core::parse_lines(&self.text)[line].syllables != 8 {
+                    finish(ctx, Err("word and line syllable counts mismatch".into()));
+                    return;
+                }
+                self.compact_rhymes = std::env::args().any(|arg| arg == "--smoke-rhymes-compact");
+                self.smoke_stage = 5;
+                return;
+            }
             if std::env::args().any(|arg| arg == "--smoke-files") {
                 let result = self.smoke_file_saving(ctx);
                 finish(ctx, result);
@@ -1676,6 +1789,12 @@ impl PoetApp {
                 return;
             }
             self.chosen = self.candidates.iter().position(|c| c.word == "багажа");
+            if std::env::args().any(|arg| arg == "--smoke-rhymes-compact") {
+                self.compact_rhymes = true;
+            }
+            if std::env::args().any(|arg| arg == "--smoke-rhymes-list") {
+                self.chosen = None;
+            }
             if std::env::args().any(|arg| arg == "--smoke-updates") {
                 self.show_updates = true;
                 self.update_message = "Установлена актуальная версия".into();
