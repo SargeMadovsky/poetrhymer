@@ -5,12 +5,20 @@ mod formatter;
 mod history;
 mod lexicon;
 mod meter;
+mod restart;
 mod storage;
 mod stress;
 mod ui;
 mod updater;
 
 fn main() -> eframe::Result {
+    let incoming = match restart::Incoming::from_arguments() {
+        Ok(incoming) => incoming,
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(());
+        }
+    };
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/poetrhymer.png"))
         .expect("Invalid embedded application icon");
     let options = eframe::NativeOptions {
@@ -24,6 +32,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Poetrhymer",
         options,
-        Box::new(|cc| Ok(Box::new(ui::PoetApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(ui::PoetApp::new(cc, incoming)))),
     )
 }

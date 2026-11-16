@@ -48,6 +48,7 @@ pub enum Event {
 enum Command {
     Record(String, Snapshot, Option<PathBuf>, String),
     Catalogue,
+    Checkpoint(Sender<Result<(), String>>),
     Preview(String),
     FileMetadata(PathBuf, String, Sender<Option<Snapshot>>),
     Stop,
@@ -164,6 +165,14 @@ impl History {
                     Ok(Command::Record(document, snapshot, path, reason)) => {
                         queue.push_back((document, snapshot, path, reason))
                     }
+                    Ok(Command::Checkpoint(reply)) => {
+                        let result = if queue.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(format!("Не удалось записать историю: {last_error}"))
+                        };
+                        let _ = reply.send(result);
+                    }
                     Ok(Command::Catalogue) => {
                         let _ = events.send(Event::Catalogue(catalogue.iter().cloned().collect()));
                         repaint();
@@ -254,6 +263,14 @@ impl History {
         {
             self.pending += 1;
         }
+    }
+
+    pub fn checkpoint(&self) -> Result<Receiver<Result<(), String>>, String> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::Checkpoint(tx))
+            .map_err(|e| e.to_string())?;
+        Ok(rx)
     }
 
     pub fn catalogue(&self) {
@@ -351,6 +368,12 @@ mod tests {
             history.record("first", snapshot(&format!("Строка {n}")), None, "Набор");
         }
         history.record("second", snapshot("Другая песня"), None, "Новый документ");
+        history
+            .checkpoint()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
         history.shutdown();
         let (mut history, recovered, warning) = History::open(dir.path().into(), || {}).unwrap();
         assert!(warning.is_none());
@@ -473,6 +496,12 @@ mod tests {
             history.rx.recv_timeout(Duration::from_secs(3)).unwrap(),
             Event::Error(_)
         ));
+        assert!(history
+            .checkpoint()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_err());
         history.record("doc", snapshot("Вторая правка"), None, "Набор");
         fs::remove_file(&root).unwrap();
         fs::rename(&offline, &root).unwrap();
@@ -489,6 +518,12 @@ mod tests {
                 _ => panic!("unexpected history event"),
             }
         }
+        history
+            .checkpoint()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
         history.shutdown();
         let (_history, recovered, _) = History::open(root.clone(), || {}).unwrap();
         assert_eq!(recovered.unwrap().1.text, "Вторая правка");

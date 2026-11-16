@@ -9,8 +9,8 @@ use std::{
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
 
 use crate::{
-    core, formatter, history, history::Snapshot as DocumentState, lexicon::Lexicon, meter, storage,
-    stress,
+    core, formatter, history, history::Snapshot as DocumentState, lexicon::Lexicon, meter, restart,
+    storage, stress,
 };
 
 const SAMPLE: &str = "[Куплет 1]\n«Где ты был, Семён Петрович?»\nТот ответил не спеша:\n«Поле было. Я работал.\nЗаготовил фуража».\n";
@@ -40,7 +40,13 @@ enum PendingAction {
     New,
     Open(PathBuf),
     Close,
+    Restart,
     CopyRevision(DocumentState),
+}
+
+enum RestartState {
+    Preparing(mpsc::Receiver<Result<restart::Pending, String>>),
+    Waiting(restart::Pending),
 }
 
 pub struct PoetApp {
@@ -113,6 +119,11 @@ pub struct PoetApp {
     requested_scroll: Option<usize>,
     editor_scroll: f32,
     visible_section: Option<usize>,
+    restart_available: bool,
+    restart_executable: Result<PathBuf, String>,
+    restart_state: Option<RestartState>,
+    restart_committed: bool,
+    incoming_restart: Option<restart::Incoming>,
     update_busy: bool,
     update_available: Option<crate::updater::Manifest>,
     update_message: String,
@@ -124,10 +135,13 @@ pub struct PoetApp {
 }
 
 impl PoetApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, incoming: Option<restart::Incoming>) -> Self {
         configure_style(&cc.egui_ctx);
         let smoke_test = std::env::args().any(|arg| arg == "--smoke-test");
-        let recovery = if smoke_test {
+        let handoff = incoming.as_ref().map(|incoming| incoming.payload.clone());
+        let recovery = if let Some(payload) = &handoff {
+            Some(payload.session.clone())
+        } else if smoke_test {
             None
         } else {
             storage::load_recovery()
@@ -158,7 +172,12 @@ impl PoetApp {
         let (history, document_id, file_path, history_error) =
             match history::History::open(history_path, move || repaint.request_repaint()) {
                 Ok((history, previous, warning)) => {
-                    let (document, path) = if let Some((summary, snapshot)) = previous {
+                    let (document, path) = if let Some(payload) = &handoff {
+                        (
+                            payload.document_id.clone(),
+                            payload.session.file_path.clone(),
+                        )
+                    } else if let Some((summary, snapshot)) = previous {
                         session.text = snapshot.text;
                         session.document_title = snapshot.title;
                         session.rhyme_links = snapshot.rhyme_links;
@@ -257,6 +276,11 @@ impl PoetApp {
             requested_scroll: None,
             editor_scroll: 0.0,
             visible_section: None,
+            restart_available: false,
+            restart_executable: std::env::current_exe().map_err(|e| e.to_string()),
+            restart_state: None,
+            restart_committed: false,
+            incoming_restart: incoming,
             update_busy: false,
             update_available: None,
             update_message: String::new(),
@@ -266,13 +290,26 @@ impl PoetApp {
             smoke_stage: 0,
             smoke_started: Instant::now(),
         };
-        if recovered {
+        if let Some(payload) = handoff {
+            app.document_id = payload.document_id;
+            app.saved_text = payload.saved_text;
+            app.saved_title = payload.saved_title;
+            app.undo = payload.undo;
+            app.redo = payload.redo;
+            app.requested_cursor = payload.cursor;
+        } else if recovered {
             app.restore_recovered_document(app.snapshot(), app.file_path.clone());
         }
         app.rhyme_links.retain(|link| link.is_valid(&app.text));
         stress::retain_valid(&app.text, &mut app.stress_marks);
         meter::retain_valid(&app.text, &mut app.meter_overrides);
+        if app.incoming_restart.is_some() {
+            return app;
+        }
         app.record_revision("Начало сессии");
+        if std::env::args().any(|arg| arg == "--smoke-restart") {
+            return app;
+        }
         app.schedule_stress();
         if !recovered {
             if let Some(at) = app.text.find("фуража") {
@@ -284,6 +321,274 @@ impl PoetApp {
             app.check_updates(&cc.egui_ctx);
         }
         app
+    }
+
+    fn smoke_restart(&mut self, ctx: &egui::Context) {
+        if self.smoke_stage == 2 {
+            return;
+        }
+        let directory = storage::app_directory();
+        let result = (|| -> Result<(), String> {
+            if std::env::args().any(|arg| arg == "--smoke-restart-child") {
+                let expected: restart::Payload = serde_json::from_slice(
+                    &std::fs::read(directory.join("expected.json")).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                if serde_json::to_value(self.recovery_session()).unwrap()
+                    != serde_json::to_value(&expected.session).unwrap()
+                    || self.saved_text != expected.saved_text
+                    || self.saved_title != expected.saved_title
+                    || self.document_id != expected.document_id
+                    || self.requested_cursor != expected.cursor
+                    || serde_json::to_value(&self.undo).unwrap()
+                        != serde_json::to_value(&expected.undo).unwrap()
+                    || serde_json::to_value(&self.redo).unwrap()
+                        != serde_json::to_value(&expected.redo).unwrap()
+                    || !self.is_dirty()
+                {
+                    let actual = restart::Payload {
+                        session: self.recovery_session(),
+                        document_id: self.document_id.clone(),
+                        saved_text: self.saved_text.clone(),
+                        saved_title: self.saved_title.clone(),
+                        undo: self.undo.clone(),
+                        redo: self.redo.clone(),
+                        cursor: self.requested_cursor,
+                    };
+                    let _ = std::fs::write(
+                        directory.join("actual.json"),
+                        serde_json::to_vec(&actual).unwrap(),
+                    );
+                    return Err(
+                        "session/baseline/undo/cursor transfer mismatch (see actual.json)".into(),
+                    );
+                }
+                if storage::read_text(self.file_path.as_ref().unwrap())? != "Оригинал\n" {
+                    return Err("restart saved the document without consent".into());
+                }
+                // Ensure the child can still save to the original path, only on explicit Save.
+                if !self.save(false) || self.is_dirty() {
+                    return Err("explicit save after restart failed".into());
+                }
+                if storage::read_text(self.file_path.as_ref().unwrap())? != self.text {
+                    return Err("explicit save wrote the wrong file".into());
+                }
+                Ok(())
+            } else {
+                if self.smoke_stage != 0 {
+                    return Err(self.update_message.clone());
+                }
+                let original = directory.join("original.txt");
+                storage::write_text(&original, "Оригинал\n")?;
+                self.replace_document("Оригинал\n".into(), Some(original));
+                self.text = "Не спеша\nФуража\n".into();
+                self.document_title = Some("Несохранённая песня".into());
+                self.after_document_change("Правка до перезапуска");
+                self.rhyme_links
+                    .push(core::RhymeLink::new(&self.text, 1, Some(0), "спеша".into()).unwrap());
+                self.stress_marks.push(stress::Mark {
+                    start: self.text.find("Фуража").unwrap(),
+                    word: "Фуража".into(),
+                    vowel: Some(2),
+                });
+                self.meter_overrides.push(meter::Override {
+                    scope: meter::Scope::Line,
+                    start: 0,
+                    guard: Some("Не спеша".into()),
+                    choice: meter::Choice::Regular(meter::Meter::Iamb),
+                    feet: Some(2),
+                });
+                self.stress_mode = true;
+                self.meter_mode = true;
+                self.compact_rhymes = true;
+                self.undo = vec![self.snapshot()];
+                self.redo = vec![self.snapshot()];
+                self.record_revision("Разметка до перезапуска");
+                self.request_action(PendingAction::Restart, ctx);
+                if !matches!(self.pending_action, Some(PendingAction::Restart))
+                    || self.restart_state.is_some()
+                {
+                    return Err("dirty restart did not ask to save".into());
+                }
+                self.pending_action = None; // Cancel leaves the editor intact.
+                if !self.is_dirty() {
+                    return Err("cancel cleared dirty state".into());
+                }
+                // Simulate self-replace, which relocates the running EXE on Windows.
+                let executable = self.restart_executable.clone()?;
+                let replacement = directory.join("replacement.exe");
+                std::fs::copy(&executable, &replacement).map_err(|e| e.to_string())?;
+                self_replace::self_replace(&replacement).map_err(|e| e.to_string())?;
+                let cursor_id = egui::Id::new("restart-test-cursor");
+                let mut cursor_state =
+                    egui::TextEdit::load_state(ctx, cursor_id).unwrap_or_default();
+                cursor_state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(5),
+                    )));
+                cursor_state.store(ctx, cursor_id);
+                self.poem_editor_id = Some(cursor_id);
+                let expected = restart::Payload {
+                    session: self.recovery_session(),
+                    document_id: self.document_id.clone(),
+                    saved_text: self.saved_text.clone(),
+                    saved_title: self.saved_title.clone(),
+                    undo: self.undo.clone(),
+                    redo: self.redo.clone(),
+                    cursor: Some(5),
+                };
+                std::fs::write(
+                    directory.join("expected.json"),
+                    serde_json::to_vec(&expected).unwrap(),
+                )
+                .map_err(|e| e.to_string())?;
+                self.request_action(PendingAction::Restart, ctx);
+                let action = self
+                    .pending_action
+                    .take()
+                    .ok_or("second save prompt missing")?;
+                self.execute_action(action, ctx); // Continue without saving.
+                self.smoke_stage = 1;
+                return Ok(());
+            }
+        })();
+        if std::env::args().any(|arg| arg == "--smoke-restart-child") || result.is_err() {
+            let report = match result { Ok(()) => "PASS: restart after self-replace, unsaved UTF-8 text/title/annotations/baseline/undo/redo, save prompt/cancel, explicit save to original".into(), Err(e) => format!("FAIL: {e}") };
+            let _ = std::fs::write(directory.join("restart-result.txt"), report);
+            self.smoke_stage = 2;
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    fn start_restart(&mut self, ctx: &egui::Context) {
+        if self.restart_state.is_some() {
+            return;
+        }
+        self.record_revision("Перед перезапуском");
+        let preparation = (|| {
+            let executable = self.restart_executable.clone()?;
+            let checkpoint = self
+                .history
+                .as_ref()
+                .map(|history| history.checkpoint())
+                .transpose()?;
+            let cursor = self
+                .poem_editor_id
+                .and_then(|id| egui::TextEdit::load_state(ctx, id))
+                .and_then(|state| state.cursor.char_range())
+                .map(|range| range.primary.index);
+            let payload = restart::Payload {
+                session: self.recovery_session(),
+                document_id: self.document_id.clone(),
+                saved_text: self.saved_text.clone(),
+                saved_title: self.saved_title.clone(),
+                undo: self.undo.clone(),
+                redo: self.redo.clone(),
+                cursor,
+            };
+            let (tx, rx) = mpsc::channel();
+            let repaint = ctx.clone();
+            let smoke_test = self.smoke_test;
+            std::thread::spawn(move || {
+                let _ = tx.send(restart::prepare(
+                    &executable,
+                    payload,
+                    checkpoint,
+                    smoke_test,
+                ));
+                repaint.request_repaint();
+            });
+            Ok::<_, String>(RestartState::Preparing(rx))
+        })();
+        match preparation {
+            Ok(state) => self.restart_state = Some(state),
+            Err(error) => self.restart_error(error),
+        }
+        ctx.request_repaint();
+    }
+
+    fn restart_error(&mut self, error: String) {
+        self.update_message =
+            format!("Перезапуск не выполнен: {error}. Текст остаётся в этом окне.");
+        self.set_status(self.update_message.clone(), true);
+        self.show_updates = true;
+    }
+
+    // Freeze both editors until the new window acknowledges ownership of the session.
+    fn restart_frame(&mut self, ctx: &egui::Context) -> bool {
+        if self.restart_committed {
+            return true;
+        }
+        if let Some(incoming) = &mut self.incoming_restart {
+            match incoming.poll() {
+                Ok(true) => {
+                    self.incoming_restart = None;
+                    if self.smoke_test && std::env::args().any(|arg| arg == "--smoke-restart-child")
+                    {
+                        return false;
+                    }
+                    self.record_revision("Перезапуск после обновления");
+                    self.schedule_stress();
+                    self.load_dictionary(ctx);
+                    if !self.smoke_test {
+                        self.check_updates(ctx);
+                    }
+                    self.set_status(
+                        "Редактор перезапущен. Текст и история восстановлены.",
+                        false,
+                    );
+                    return false;
+                }
+                Err(_) => {
+                    self.allow_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return true;
+                }
+                Ok(false) => {}
+            }
+        } else if let Some(state) = self.restart_state.take() {
+            let next = match state {
+                RestartState::Preparing(rx) => match rx.try_recv() {
+                    Ok(Ok(pending)) => Ok(Some(RestartState::Waiting(pending))),
+                    Ok(Err(error)) => Err(error),
+                    Err(mpsc::TryRecvError::Empty) => Ok(Some(RestartState::Preparing(rx))),
+                    Err(_) => Err("Подготовка перезапуска прервана".into()),
+                },
+                RestartState::Waiting(mut pending) => match pending.poll() {
+                    Ok(true) => {
+                        self.restart_committed = true;
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        Ok(None)
+                    }
+                    Ok(false) => Ok(Some(RestartState::Waiting(pending))),
+                    Err(error) => Err(error),
+                },
+            };
+            match next {
+                Ok(state) => self.restart_state = state,
+                Err(error) => {
+                    self.restart_error(error);
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+        if !self.allow_close && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Перезапускаем Poetrhymer. Сохраняем историю и переносим текст…");
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(50));
+        true
     }
 
     fn recovery_session(&self) -> storage::Session {
@@ -557,6 +862,9 @@ impl PoetApp {
             .show(ctx, |ui| {
             ui.label(format!("Текущая версия: {}", env!("CARGO_PKG_VERSION")));
             ui.label(&self.update_message);
+            if self.restart_available && ui.button("Перезапустить Poetrhymer").clicked() {
+                self.request_action(PendingAction::Restart, ctx);
+            }
             if self.update_busy { ui.spinner(); }
             if let Some(manifest) = self.update_available.clone() {
                 if ui.add_enabled(!self.update_busy, egui::Button::new("Скачать и установить")).clicked() {
@@ -565,9 +873,9 @@ impl PoetApp {
                     let tx = self.tx.clone(); let ctx = ctx.clone();
                     std::thread::spawn(move || { let _ = tx.send(Background::UpdateInstalled(crate::updater::install(&manifest))); ctx.request_repaint(); });
                 }
-                ui.label("Перед установкой проверяются подпись и контрольная сумма. Текст останется открыт; новая версия запустится при следующем открытии приложения.");
+                ui.label("Перед установкой проверяются подпись и контрольная сумма. После установки можно перезапустить редактор. Несохранённый текст и история будут восстановлены.");
             }
-            if ui.add_enabled(!self.update_busy, egui::Button::new("Проверить обновления")).clicked() { self.check_updates(ctx); }
+            if ui.add_enabled(!self.update_busy && !self.restart_available, egui::Button::new("Проверить обновления")).clicked() { self.check_updates(ctx); }
             ui.hyperlink_to("Страница выпусков", format!("{}/releases", crate::updater::REPOSITORY));
         });
         self.show_updates = open;
@@ -703,7 +1011,8 @@ impl PoetApp {
                     self.update_message = match result {
                         Ok(()) => {
                             self.update_available = None;
-                            "Обновление установлено. Закройте и снова откройте Poetrhymer.".into()
+                            self.restart_available = true;
+                            "Обновление установлено.".into()
                         }
                         Err(error) => format!("Ошибка обновления: {error}"),
                     };
@@ -964,6 +1273,7 @@ impl PoetApp {
 
     fn execute_action(&mut self, action: PendingAction, ctx: &egui::Context) {
         match action {
+            PendingAction::Restart => self.start_restart(ctx),
             PendingAction::Close => {
                 self.allow_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2000,7 +2310,8 @@ impl PoetApp {
                 let editor_id = ui.make_persistent_id("poem_text");
                 self.poem_editor_id = Some(editor_id);
                 if let Some(cursor) = self.requested_cursor.take() {
-                    if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
+                    {
+                        let mut state = egui::TextEdit::load_state(ctx, editor_id).unwrap_or_default();
                         state
                             .cursor
                             .set_char_range(Some(egui::text::CCursorRange::one(
@@ -2222,6 +2533,9 @@ impl PoetApp {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label("В тексте есть несохранённые изменения.");
+                if matches!(self.pending_action, Some(PendingAction::Restart)) {
+                    ui.label("Без сохранения файл не изменится; текущие правки будут перенесены в новую копию редактора.");
+                }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button("Сохранить").clicked() {
@@ -2507,7 +2821,8 @@ impl PoetApp {
             }
             if std::env::args().any(|arg| arg == "--smoke-updates") {
                 self.show_updates = true;
-                self.update_message = "Установлена актуальная версия".into();
+                self.restart_available = true;
+                self.update_message = "Обновление установлено.".into();
             }
             self.set_status("Проверено: словарь, поиск, замена, отмена и повтор.", false);
             self.smoke_started = Instant::now();
@@ -2897,6 +3212,16 @@ impl PoetApp {
 
 impl eframe::App for PoetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.restart_frame(ctx) {
+            return;
+        }
+        if self.smoke_test
+            && std::env::args()
+                .any(|arg| arg == "--smoke-restart" || arg == "--smoke-restart-child")
+        {
+            self.smoke_restart(ctx);
+            return;
+        }
         self.receive_background();
         self.receive_history();
         let open_stress = self.stress_mode
@@ -3019,6 +3344,10 @@ impl eframe::App for PoetApp {
         }
         self.dictionary_window(ctx);
         self.updates_window(ctx);
+        if self.restart_state.is_some() {
+            ctx.request_repaint();
+            return;
+        }
         self.history_window(ctx);
         self.stress_window(ctx);
         self.pending_window(ctx);
@@ -3044,7 +3373,7 @@ impl eframe::App for PoetApp {
         if let Some(history) = &mut self.history {
             history.shutdown();
         }
-        if self.smoke_test {
+        if self.smoke_test || self.restart_committed || self.incoming_restart.is_some() {
             return;
         }
         let _ = storage::save_recovery(&self.recovery_session());
