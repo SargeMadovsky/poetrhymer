@@ -5,6 +5,7 @@ mod formatter;
 mod history;
 mod lexicon;
 mod storage;
+mod stress;
 mod ui;
 mod updater;
 

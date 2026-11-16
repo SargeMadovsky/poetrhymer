@@ -18,6 +18,8 @@ pub struct Snapshot {
     pub text: String,
     pub title: Option<String>,
     pub rhyme_links: Vec<crate::core::RhymeLink>,
+    #[serde(default)]
+    pub stress_marks: Vec<crate::stress::Mark>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,6 +32,8 @@ pub struct Summary {
     pub time: u64,
     pub chars: usize,
     hash: String,
+    #[serde(default)]
+    text_hash: Option<String>,
 }
 
 pub enum Event {
@@ -43,6 +47,7 @@ enum Command {
     Record(String, Snapshot, Option<PathBuf>, String),
     Catalogue,
     Preview(String),
+    FileMetadata(PathBuf, String, Sender<Option<Snapshot>>),
     Stop,
 }
 
@@ -169,6 +174,21 @@ impl History {
                         let _ = events.send(event);
                         repaint();
                     }
+                    Ok(Command::FileMetadata(path, text, reply)) => {
+                        let digest = hex::encode(Sha256::digest(text.as_bytes()));
+                        let snapshot = catalogue
+                            .iter()
+                            .filter(|entry| {
+                                entry.path.as_ref() == Some(&path)
+                                    && entry.text_hash.as_ref() == Some(&digest)
+                            })
+                            .find_map(|entry| {
+                                read_revision(&root, &entry.id)
+                                    .ok()
+                                    .filter(|snapshot| snapshot.text == text)
+                            });
+                        let _ = reply.send(snapshot);
+                    }
                     Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                         stopping = true
                     }
@@ -241,6 +261,15 @@ impl History {
         let _ = self.tx.send(Command::Preview(id.into()));
     }
 
+    pub fn file_metadata(&self, path: PathBuf, text: String) -> Result<Option<Snapshot>, String> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::FileMetadata(path, text, tx))
+            .map_err(|e| e.to_string())?;
+        rx.recv_timeout(Duration::from_secs(3))
+            .map_err(|e| e.to_string())
+    }
+
     pub fn shutdown(&mut self) {
         if let Some(worker) = self.worker.take() {
             let _ = self.tx.send(Command::Stop);
@@ -284,6 +313,7 @@ fn append(
         time: id / 1_000_000,
         chars: snapshot.text.chars().count(),
         hash: hex::encode(Sha256::digest(&bytes)),
+        text_hash: Some(hex::encode(Sha256::digest(snapshot.text.as_bytes()))),
     };
     let mut temp = tempfile::NamedTempFile::new_in(root).map_err(|e| e.to_string())?;
     serde_json::to_writer(&mut temp, &summary).map_err(|e| e.to_string())?;
@@ -305,6 +335,7 @@ mod tests {
             text: text.into(),
             title: Some("Песня".into()),
             rhyme_links: vec![],
+            stress_marks: vec![],
         }
     }
 
@@ -362,6 +393,11 @@ mod tests {
         state
             .rhyme_links
             .push(crate::core::RhymeLink::new(&state.text, 1, Some(0), "спеша".into()).unwrap());
+        state.stress_marks.push(crate::stress::Mark {
+            start: state.text.find("Фуража").unwrap(),
+            word: "Фуража".into(),
+            vowel: Some(2),
+        });
         let path = PathBuf::from("C:/lyrics/песня.txt");
         let summary = append(
             dir.path(),
@@ -380,6 +416,37 @@ mod tests {
         );
         let state = read_revision(dir.path(), &summary.id).unwrap();
         assert!(state.rhyme_links[0].is_valid(&state.text));
+        assert_eq!(state.stress_marks.len(), 1);
+        assert_eq!(state.stress_marks[0].vowel, Some(2));
+    }
+
+    #[test]
+    fn reopening_a_file_restores_only_metadata_for_matching_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("C:/lyrics/замок.txt");
+        let (mut history, _, _) = History::open(dir.path().into(), || {}).unwrap();
+        let mut state = snapshot("Замок");
+        state.stress_marks.push(crate::stress::Mark {
+            start: 0,
+            word: "Замок".into(),
+            vowel: Some(1),
+        });
+        history.record("first", state, Some(path.clone()), "Ручное ударение");
+        history.shutdown();
+        let (history, _, _) = History::open(dir.path().into(), || {}).unwrap();
+        let metadata = history
+            .file_metadata(path.clone(), "Замок".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.stress_marks[0].vowel, Some(1));
+        assert!(history
+            .file_metadata(path, "Новый замок".into())
+            .unwrap()
+            .is_none());
+        assert!(history
+            .file_metadata(PathBuf::from("C:/other/замок.txt"), "Замок".into())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

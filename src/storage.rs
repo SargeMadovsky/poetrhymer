@@ -18,6 +18,10 @@ pub struct Session {
     pub file_path: Option<PathBuf>,
     #[serde(default)]
     pub compact_rhymes: bool,
+    #[serde(default)]
+    pub stress_marks: Vec<crate::stress::Mark>,
+    #[serde(default)]
+    pub stress_mode: bool,
 }
 
 /// A recovered draft is already safe in local recovery. For a named file,
@@ -161,6 +165,8 @@ mod tests {
         assert!(session.document_title.is_none());
         assert!(session.file_path.is_none());
         assert!(!session.compact_rhymes);
+        assert!(!session.stress_mode);
+        assert!(session.stress_marks.is_empty());
     }
 
     #[test]
@@ -176,11 +182,19 @@ mod tests {
             last_document_folder: Some(dir.path().into()),
             file_path: Some(path.clone()),
             compact_rhymes: true,
+            stress_marks: vec![crate::stress::Mark {
+                start: 0,
+                word: "Первая".into(),
+                vowel: Some(0),
+            }],
+            stress_mode: true,
         };
         let restored: Session =
             serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
         assert_eq!(restored.file_path, Some(path.clone()));
         assert!(restored.compact_rhymes);
+        assert!(restored.stress_mode);
+        assert_eq!(restored.stress_marks, session.stress_marks);
         let baseline = saved_text_after_recovery(&restored.text, restored.file_path.as_deref());
         assert_eq!(baseline.as_deref(), Some(restored.text.as_str()));
         assert_ne!(baseline.as_deref(), Some("Новая правка"));

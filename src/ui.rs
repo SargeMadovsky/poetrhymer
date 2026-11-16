@@ -9,7 +9,7 @@ use std::{
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
 
 use crate::{
-    core, formatter, history, history::Snapshot as DocumentState, lexicon::Lexicon, storage,
+    core, formatter, history, history::Snapshot as DocumentState, lexicon::Lexicon, storage, stress,
 };
 
 const SAMPLE: &str = "[Куплет 1]\n«Где ты был, Семён Петрович?»\nТот ответил не спеша:\n«Поле было. Я работал.\nЗаготовил фуража».\n";
@@ -28,6 +28,7 @@ struct Selection {
 }
 
 enum Background {
+    Stress(u64, Arc<stress::Analysis>),
     Dictionary(u64, Result<(Arc<Lexicon>, Vec<String>), String>),
     Search(u64, Vec<core::Candidate>),
     UpdateCheck(Result<Option<crate::updater::Manifest>, String>),
@@ -52,6 +53,17 @@ pub struct PoetApp {
     history_entries: Vec<history::Summary>,
     history_selected: Option<String>,
     history_preview: Option<DocumentState>,
+    stress_mode: bool,
+    stress_marks: Vec<stress::Mark>,
+    stress_text: String,
+    stress_analysis: Option<Arc<stress::Analysis>>,
+    stress_ticket: u64,
+    stress_due: Option<Instant>,
+    stress_loading: bool,
+    stress_selected: Option<usize>,
+    stress_popup_pos: egui::Pos2,
+    poem_editor_id: Option<egui::Id>,
+    stress_focus: bool,
     text: String,
     saved_text: Option<String>,
     saved_title: Option<String>,
@@ -124,6 +136,8 @@ impl PoetApp {
             last_document_folder: None,
             file_path: None,
             compact_rhymes: false,
+            stress_marks: Vec::new(),
+            stress_mode: false,
         });
         let history_temp =
             smoke_test.then(|| tempfile::tempdir().expect("smoke-test history directory"));
@@ -140,6 +154,7 @@ impl PoetApp {
                         session.text = snapshot.text;
                         session.document_title = snapshot.title;
                         session.rhyme_links = snapshot.rhyme_links;
+                        session.stress_marks = snapshot.stress_marks;
                         recovered = true;
                         (summary.document, summary.path)
                     } else {
@@ -173,6 +188,17 @@ impl PoetApp {
             saved_text: Some(session.text.clone()),
             saved_title: session.document_title.clone(),
             document_title: session.document_title,
+            stress_mode: session.stress_mode,
+            stress_marks: session.stress_marks,
+            stress_text: session.text.clone(),
+            stress_analysis: None,
+            stress_ticket: 0,
+            stress_due: None,
+            stress_loading: false,
+            stress_selected: None,
+            stress_popup_pos: egui::pos2(350.0, 200.0),
+            poem_editor_id: None,
+            stress_focus: false,
             text: session.text,
             file_path,
             last_document_folder: session.last_document_folder,
@@ -230,7 +256,9 @@ impl PoetApp {
             app.restore_recovered_document(app.snapshot(), app.file_path.clone());
         }
         app.rhyme_links.retain(|link| link.is_valid(&app.text));
+        stress::retain_valid(&app.text, &mut app.stress_marks);
         app.record_revision("Начало сессии");
+        app.schedule_stress();
         if !recovered {
             if let Some(at) = app.text.find("фуража") {
                 app.select_word(at);
@@ -252,6 +280,8 @@ impl PoetApp {
             last_document_folder: self.last_document_folder.clone(),
             file_path: self.file_path.clone(),
             compact_rhymes: self.compact_rhymes,
+            stress_marks: self.stress_marks.clone(),
+            stress_mode: self.stress_mode,
         }
     }
 
@@ -397,6 +427,16 @@ impl PoetApp {
                                 (&selected_summary, &self.history_preview)
                             {
                                 ui.label(RichText::new(&summary.title).strong());
+                                if !snapshot.stress_marks.is_empty() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Ручных отметок ударения: {}",
+                                            snapshot.stress_marks.len()
+                                        ))
+                                        .small()
+                                        .color(MUTED),
+                                    );
+                                }
                                 if let Some(path) = &summary.path {
                                     ui.label(
                                         RichText::new(path.display().to_string())
@@ -531,6 +571,7 @@ impl PoetApp {
         self.dictionary_loading = true;
         self.dictionary_error = None;
         self.lexicon = None;
+        self.schedule_stress();
         self.parts_of_speech.clear();
         self.invalidate_search();
         let folder = PathBuf::from(self.dictionary_folder.trim());
@@ -598,6 +639,10 @@ impl PoetApp {
     fn receive_background(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
+                Background::Stress(ticket, analysis) if ticket == self.stress_ticket => {
+                    self.stress_loading = false;
+                    self.stress_analysis = Some(analysis);
+                }
                 Background::Dictionary(ticket, result) if ticket == self.dictionary_ticket => {
                     self.dictionary_loading = false;
                     match result {
@@ -605,6 +650,7 @@ impl PoetApp {
                             self.lexicon = Some(lexicon);
                             self.parts_of_speech = parts;
                             self.schedule_search();
+                            self.schedule_stress();
                         }
                         Err(error) => {
                             self.dictionary_error = Some(error);
@@ -700,6 +746,10 @@ impl PoetApp {
     }
 
     fn after_document_change(&mut self, reason: &str) {
+        stress::rebase(&self.stress_text, &self.text, &mut self.stress_marks);
+        self.stress_text = self.text.clone();
+        self.stress_selected = None;
+        self.schedule_stress();
         self.rhyme_links.retain(|link| link.is_valid(&self.text));
         self.revision += 1;
         self.selection = None;
@@ -714,6 +764,7 @@ impl PoetApp {
             text: self.text.clone(),
             title: self.document_title.clone(),
             rhyme_links: self.rhyme_links.clone(),
+            stress_marks: self.stress_marks.clone(),
         }
     }
 
@@ -721,6 +772,11 @@ impl PoetApp {
         self.text = state.text;
         self.document_title = state.title;
         self.rhyme_links = state.rhyme_links;
+        self.stress_marks = state.stress_marks;
+        self.stress_text = self.text.clone();
+        stress::retain_valid(&self.text, &mut self.stress_marks);
+        self.stress_selected = None;
+        self.schedule_stress();
     }
 
     fn restore_recovered_document(&mut self, state: DocumentState, path: Option<PathBuf>) {
@@ -903,13 +959,34 @@ impl PoetApp {
                 );
             }
             PendingAction::Open(path) => match storage::read_text(&path) {
-                Ok(text) => self.replace_document(text, Some(path)),
+                Ok(text) => {
+                    let metadata = self
+                        .history
+                        .as_ref()
+                        .map(|history| history.file_metadata(path.clone(), text.clone()))
+                        .transpose();
+                    self.replace_document(text, Some(path));
+                    match metadata {
+                        Ok(Some(Some(state))) => {
+                            self.restore_snapshot(state);
+                            self.saved_title = self.document_title.clone();
+                            self.record_revision("Восстановление разметки файла");
+                        }
+                        Err(error) => self.set_status(
+                            format!("Файл открыт, но разметка из истории недоступна: {error}"),
+                            true,
+                        ),
+                        _ => {}
+                    }
+                }
                 Err(error) => self.set_status(error, true),
             },
         }
     }
 
     fn replace_document(&mut self, text: String, path: Option<PathBuf>) {
+        self.stress_marks.clear();
+        self.stress_text = text.clone();
         self.document_id = history::new_document();
         self.rhyme_links.clear();
         self.document_title = None;
@@ -1304,6 +1381,254 @@ impl PoetApp {
             });
     }
 
+    fn schedule_stress(&mut self) {
+        self.stress_ticket += 1;
+        self.stress_analysis = None;
+        self.stress_loading = false;
+        self.stress_due = self
+            .stress_mode
+            .then(|| Instant::now() + Duration::from_millis(80));
+    }
+
+    fn start_stress(&mut self, ctx: &egui::Context) {
+        self.stress_due = None;
+        let ticket = self.stress_ticket;
+        let text = self.text.clone();
+        let marks = self.stress_marks.clone();
+        let lexicon = self.lexicon.clone();
+        let tx = self.tx.clone();
+        let ctx = ctx.clone();
+        self.stress_loading = true;
+        std::thread::spawn(move || {
+            let analysis = stress::analyze(&text, &marks, lexicon.as_deref());
+            let _ = tx.send(Background::Stress(ticket, Arc::new(analysis)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn set_word_stress(&mut self, start: usize, vowel: Option<usize>) {
+        let Some(token) = self
+            .stress_analysis
+            .as_ref()
+            .and_then(|analysis| {
+                analysis
+                    .tokens
+                    .iter()
+                    .find(|token| token.span.start == start)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        if self.text.get(token.span.clone()) != Some(token.word.as_str())
+            || vowel.is_some_and(|v| v >= token.vowels.len())
+        {
+            return;
+        }
+        if self
+            .stress_marks
+            .iter()
+            .any(|mark| mark.start == start && mark.word == token.word && mark.vowel == vowel)
+        {
+            return;
+        }
+        let previous = self.snapshot();
+        self.stress_marks.retain(|mark| mark.start != start);
+        let mut word = token.word.clone();
+        // An accent already present in the source must be replaced, not drawn twice.
+        if word.contains('\u{301}') {
+            word = vowel.map_or_else(|| stress::clean(&word), |v| stress::accented(&word, v));
+            self.text.replace_range(token.span, &word);
+            stress::rebase(&self.stress_text, &self.text, &mut self.stress_marks);
+            self.stress_text = self.text.clone();
+        }
+        self.stress_marks.push(stress::Mark { start, word, vowel });
+        let text_changed = previous.text != self.text;
+        self.push_undo(previous);
+        self.last_typing = None;
+        if text_changed {
+            self.after_document_change("Изменение ударения в тексте");
+        } else {
+            self.schedule_stress();
+            self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+            self.record_revision("Ручное ударение");
+        }
+        self.stress_selected = Some(start);
+        self.set_status("Ударение сохранено в разметке. Ctrl+Z — отменить.", false);
+    }
+
+    fn reset_word_stress(&mut self, start: usize) {
+        if !self.stress_marks.iter().any(|mark| mark.start == start) {
+            return;
+        }
+        self.push_undo(self.snapshot());
+        self.stress_marks.retain(|mark| mark.start != start);
+        self.last_typing = None;
+        self.schedule_stress();
+        self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+        self.record_revision("Автоматическое ударение");
+    }
+
+    fn open_stress_at_cursor(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.poem_editor_id else {
+            return;
+        };
+        let Some(range) =
+            egui::TextEdit::load_state(ctx, id).and_then(|state| state.cursor.char_range())
+        else {
+            return;
+        };
+        let byte = core::char_to_byte(&self.text, range.primary.index);
+        if let Some(span) = stress::word_at(&self.text, byte) {
+            self.stress_selected = Some(span.start);
+            self.stress_popup_pos = ctx.screen_rect().center() - egui::vec2(150.0, 80.0);
+            self.stress_focus = true;
+        }
+    }
+
+    fn stress_window(&mut self, ctx: &egui::Context) {
+        let Some(start) = self.stress_selected.filter(|_| self.stress_mode) else {
+            return;
+        };
+        if self.pending_action.is_some() {
+            return;
+        }
+        let token = self
+            .stress_analysis
+            .as_ref()
+            .and_then(|analysis| {
+                analysis
+                    .tokens
+                    .iter()
+                    .find(|token| token.span.start == start)
+            })
+            .cloned();
+        let mut open =
+            !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        egui::Window::new("Ударение в слове")
+            .id(egui::Id::new("word_stress"))
+            .open(&mut open)
+            .fixed_pos(self.stress_popup_pos)
+            .constrain_to(ctx.screen_rect())
+            .default_width(310.0)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let Some(token) = token else {
+                    ui.spinner();
+                    ui.label("Обновляем разметку…");
+                    return;
+                };
+                ui.label(RichText::new(&token.word).size(20.0).strong());
+                ui.label(match token.source {
+                    stress::Source::Manual => "Выбрано вручную",
+                    stress::Source::Dictionary => "Ударение из словаря",
+                    stress::Source::Text => "Ударение уже записано в тексте",
+                    stress::Source::Single => "Один слог. В строке слово может быть безударным.",
+                    stress::Source::Yo => "Подсказка по букве ё — проверьте составные слова",
+                    stress::Source::Ambiguous => "Несколько вариантов — выберите по смыслу",
+                    stress::Source::Unknown => "Нет в словаре — выберите ударную гласную",
+                });
+                if token.word.contains('\u{301}') {
+                    ui.label(
+                        RichText::new("Выбор другой гласной заменит знак в исходном слове.")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for (vowel, byte) in token.vowels.iter().enumerate() {
+                        let letter = token.word[*byte..].chars().next().unwrap();
+                        let text = RichText::new(format!("{} · {}", vowel + 1, letter)).size(18.0);
+                        let text = if token.choices.contains(&vowel) {
+                            text.underline()
+                        } else {
+                            text
+                        };
+                        let response = ui
+                            .add(egui::Button::new(text).selected(token.selected == Some(vowel)))
+                            .on_hover_text(stress::accented(&token.word, vowel));
+                        if self.stress_focus && vowel == 0 {
+                            response.request_focus();
+                            self.stress_focus = false;
+                        }
+                        if response.clicked() {
+                            self.set_word_stress(start, Some(vowel));
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Без ударения").clicked() {
+                        self.set_word_stress(start, None);
+                    }
+                    if ui
+                        .add_enabled(
+                            self.stress_marks.iter().any(|mark| mark.start == start),
+                            egui::Button::new("Авто"),
+                        )
+                        .clicked()
+                    {
+                        self.reset_word_stress(start);
+                    }
+                });
+                ui.label(
+                    RichText::new("Подчёркнуты словарные варианты · Esc — закрыть")
+                        .small()
+                        .color(MUTED),
+                );
+            });
+        if !open {
+            self.stress_selected = None;
+            if let Some(id) = self.poem_editor_id {
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
+        }
+    }
+
+    fn export_stress(&mut self) {
+        let Some(analysis) = &self.stress_analysis else {
+            return;
+        };
+        let text = stress::export(&self.text, analysis);
+        let unresolved = analysis.ambiguous + analysis.unknown;
+        let filename = formatter::suggested_filename(self.document_title.as_deref());
+        let filename = format!("{} — ударения.txt", filename.trim_end_matches(".txt"));
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Экспорт с ударениями")
+            .set_directory(
+                self.last_document_folder
+                    .clone()
+                    .unwrap_or_else(storage::documents_directory),
+            )
+            .set_file_name(filename)
+            .add_filter("Текст UTF-8", &["txt"])
+            .save_file()
+        else {
+            return;
+        };
+        let same_file = self.file_path.as_ref().is_some_and(|original| {
+            original == &path
+                || original
+                    .canonicalize()
+                    .ok()
+                    .zip(path.canonicalize().ok())
+                    .is_some_and(|(a, b)| a == b)
+        });
+        if same_file {
+            self.set_status("Для экспорта с ударениями выберите другое имя файла.", true);
+            return;
+        }
+        match storage::write_text(&path, &text) {
+            Ok(()) => self.set_status(
+                format!(
+                    "Экспорт с ударениями сохранён. Слов без выбранного ударения: {unresolved}."
+                ),
+                false,
+            ),
+            Err(error) => self.set_status(error, true),
+        }
+    }
+
     fn editor(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(
@@ -1327,14 +1652,30 @@ impl PoetApp {
                     if ui.add(egui::Button::new("Форматировать").wrap_mode(egui::TextWrapMode::Extend)).on_hover_text("Убрать Markdown, вынести # название в верхнюю панель и оформить секции в [скобках]").clicked() {
                         self.format_document();
                     }
-                    if ui.available_width() > 300.0 {
+                    if ui.selectable_label(self.stress_mode, "Ударения").on_hover_text("Показывать ударения в стихотворении; нажмите на гласную, чтобы исправить").clicked() {
+                        self.stress_mode = !self.stress_mode;
+                        self.stress_selected = None;
+                        self.schedule_stress();
+                        self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+                    }
+                    if self.stress_mode && ui.add_enabled(self.stress_analysis.is_some(), egui::Button::new("Экспорт с ударениями").wrap_mode(egui::TextWrapMode::Extend)).clicked() { self.export_stress(); }
+                    if !self.stress_mode && ui.available_rect_before_wrap().width() > 300.0 {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(RichText::new("Последние слова — точки для новых рифм").size(12.0).color(MUTED));
                         });
                     }
                 });
+                if self.stress_mode {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Гласная — ударение · согласная или Ctrl+Enter — варианты").small().color(MUTED));
+                        if let Some(analysis) = &self.stress_analysis {
+                            ui.label(RichText::new(format!("Неоднозначно: {} · нет в словаре: {}", analysis.ambiguous, analysis.unknown)).small().color(ACCENT));
+                        } else { ui.spinner(); }
+                    });
+                }
                 ui.add_space(24.0);
                 let editor_id = ui.make_persistent_id("poem_text");
+                self.poem_editor_id = Some(editor_id);
                 if let Some(cursor) = self.requested_cursor.take() {
                     if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
                         state
@@ -1408,6 +1749,7 @@ impl PoetApp {
                     ui.fonts(|fonts| fonts.layout_job(job))
                 };
                 let mut clicked_position = None;
+                let mut stress_hit = None;
                 let mut changed = false;
                 let scroll_output = egui::ScrollArea::vertical()
                     .id_salt("poem_scroll")
@@ -1424,6 +1766,11 @@ impl PoetApp {
                             .hint_text("[Куплет 1]\nНачните писать или вставьте заготовку…")
                             .layouter(&mut layouter)
                             .show(ui);
+                        if self.stress_mode && !output.response.changed() {
+                            if let Some(analysis) = &self.stress_analysis {
+                                stress_hit = paint_stresses(ui, &output.galley, output.galley_pos, &output.response, analysis);
+                            }
+                        }
                         let numbers = core::verse_numbers(&self.text);
                         // Track the section at the top reading edge, including wrapped lines.
                         // Include the first line's height: the scroll clip can start
@@ -1480,7 +1827,13 @@ impl PoetApp {
                 }
                 if let Some(character) = clicked_position {
                     self.last_typing = None;
-                    self.select_word(core::char_to_byte(&self.text, character));
+                    if self.stress_mode {
+                        if let Some((start, vowel, pos)) = stress_hit {
+                            self.stress_popup_pos = pos;
+                            self.stress_selected = Some(start);
+                            if let Some(vowel) = vowel { self.set_word_stress(start, Some(vowel)); }
+                        } else { self.stress_selected = None; }
+                    } else { self.select_word(core::char_to_byte(&self.text, character)); }
                 }
             });
     }
@@ -1711,6 +2064,14 @@ impl PoetApp {
                 finish(ctx, Err("багажа missing from candidates".into()));
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
+            if std::env::args().any(|arg| arg == "--smoke-stress") {
+                self.replace_document("[Куплет 1]\nСтарый замок на горе,\nЁжик прячется в траве.\nФыжобряк тихонько дышит,\nОблачённый ветром слышит.\n".into(), None);
+                self.stress_mode = true;
+                self.schedule_stress();
+                self.smoke_stage = 18;
+                return;
+            }
+
             if std::env::args().any(|arg| arg == "--smoke-rhymes-syllables") {
                 self.replace_document("[Куплет 1]\nНе министр, не учёный,\nНе артист и не пилот —\nВ серый ватник облачённый\nТракторист Семён Петров.\n".into(), None);
                 self.select_word(self.text.find("облачённый").unwrap());
@@ -1800,6 +2161,134 @@ impl PoetApp {
                 self.update_message = "Установлена актуальная версия".into();
             }
             self.set_status("Проверено: словарь, поиск, замена, отмена и повтор.", false);
+            self.smoke_started = Instant::now();
+            self.smoke_stage = 2;
+        } else if self.smoke_stage == 18 && self.stress_analysis.is_some() {
+            let start = self.text.find("замок").unwrap();
+            let before = self.text.clone();
+            self.set_word_stress(start, Some(1));
+            if self.text != before || self.stress_marks.len() != 1 {
+                finish(ctx, Err("manual stress changed plain text".into()));
+                return;
+            }
+            self.undo();
+            if !self.stress_marks.is_empty() {
+                finish(ctx, Err("stress undo failed".into()));
+                return;
+            }
+            self.redo();
+            if self.stress_marks.len() != 1 || self.stress_marks[0].vowel != Some(1) {
+                finish(ctx, Err("stress redo failed".into()));
+                return;
+            }
+            let session: storage::Session =
+                serde_json::from_slice(&serde_json::to_vec(&self.recovery_session()).unwrap())
+                    .unwrap();
+            if session.stress_marks != self.stress_marks || !session.stress_mode {
+                finish(ctx, Err("stress recovery roundtrip failed".into()));
+                return;
+            }
+            self.history.as_ref().unwrap().catalogue();
+            self.smoke_stage = 19;
+        } else if self.smoke_stage == 19
+            && self.stress_analysis.is_some()
+            && !self.history_entries.is_empty()
+        {
+            let exported = stress::export(&self.text, self.stress_analysis.as_deref().unwrap());
+            if !exported.contains("замо́к") || self.text.contains('\u{301}') {
+                finish(ctx, Err("stress export/source mismatch".into()));
+                return;
+            }
+            let Some(entry) = self.history_entries.iter().find(|entry| {
+                entry.document == self.document_id && entry.reason == "Ручное ударение"
+            }) else {
+                return;
+            };
+            self.history_selected = Some(entry.id.clone());
+            self.history.as_ref().unwrap().preview(&entry.id);
+            self.smoke_stage = 20;
+        } else if self.smoke_stage == 20 && self.history_preview.is_some() {
+            if self.history_preview.as_ref().unwrap().stress_marks != self.stress_marks {
+                finish(ctx, Err("revision lost stress marks".into()));
+                return;
+            }
+            let before = self.snapshot();
+            let path = self
+                ._history_temp
+                .as_ref()
+                .unwrap()
+                .path()
+                .join("stress-fixture.txt");
+            if !self.save_to(path.clone()) {
+                finish(ctx, Err("saving stress fixture failed".into()));
+                return;
+            }
+            self.execute_action(PendingAction::Open(path), ctx);
+            if self.stress_marks != before.stress_marks || self.is_dirty() {
+                finish(
+                    ctx,
+                    Err("reopening lost stress marks or marked file dirty".into()),
+                );
+                return;
+            }
+            self.restore_snapshot(DocumentState {
+                text: "За́мок и сосед".into(),
+                title: None,
+                rhyme_links: vec![],
+                stress_marks: vec![],
+            });
+            self.stress_analysis = Some(Arc::new(stress::analyze(
+                &self.text,
+                &[],
+                self.lexicon.as_deref(),
+            )));
+            self.set_word_stress(0, Some(1));
+            if self.text != "Замо́к и сосед" {
+                finish(ctx, Err("existing accent correction failed".into()));
+                return;
+            }
+            self.undo();
+            if self.text != "За́мок и сосед" || !self.stress_marks.is_empty() {
+                finish(ctx, Err("existing accent undo failed".into()));
+                return;
+            }
+            self.redo();
+            self.text.insert_str(0, "И ");
+            self.after_document_change("Проверка смещения метки");
+            if self.stress_marks.first().map(|mark| mark.start) != Some("И ".len()) {
+                finish(ctx, Err("stress mark did not shift after insertion".into()));
+                return;
+            }
+            let mark = self.stress_marks[0].clone();
+            self.text
+                .replace_range(mark.start..mark.start + mark.word.len(), "Домок");
+            self.after_document_change("Проверка сброса метки");
+            if !self.stress_marks.is_empty() {
+                finish(ctx, Err("changed word retained manual stress".into()));
+                return;
+            }
+            self.restore_recovered_document(before, self.file_path.clone());
+            self.undo.clear();
+            self.redo.clear();
+            let start = self.text.find("замок").unwrap();
+            let editor = self.poem_editor_id.unwrap();
+            let mut state = egui::TextEdit::load_state(ctx, editor).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(core::byte_to_char(&self.text, start)),
+                )));
+            state.store(ctx, editor);
+            self.open_stress_at_cursor(ctx);
+            if self.stress_selected != Some(start) {
+                finish(ctx, Err("keyboard stress selection failed".into()));
+                return;
+            }
+            self.stress_popup_pos = egui::pos2(530.0, 440.0);
+            self.set_status(
+                "Проверено: ударения, ручной выбор, отмена, повтор, ревизии и экспорт.",
+                false,
+            );
             self.smoke_started = Instant::now();
             self.smoke_stage = 2;
         } else if self.smoke_stage == 15
@@ -1962,7 +2451,9 @@ impl PoetApp {
             }
             self.smoke_started = Instant::now();
             self.smoke_stage = 2;
-        } else if self.smoke_stage == 2 && self.smoke_started.elapsed() > Duration::from_millis(400)
+        } else if self.smoke_stage == 2
+            && (!self.stress_mode || self.stress_analysis.is_some())
+            && self.smoke_started.elapsed() > Duration::from_millis(400)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.smoke_stage = 3;
@@ -2003,6 +2494,23 @@ impl eframe::App for PoetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_background();
         self.receive_history();
+        let open_stress = self.stress_mode
+            && self.pending_action.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+        if self.stress_mode
+            && self.stress_selected.is_some()
+            && self.pending_action.is_none()
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.stress_selected = None;
+            self.stress_focus = false;
+            if let Some(id) = self.poem_editor_id {
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
+        }
+        if self.stress_due.is_some_and(|due| Instant::now() >= due) {
+            self.start_stress(ctx);
+        }
         if ctx.input(|input| input.viewport().close_requested())
             && !self.allow_close
             && !self.smoke_test
@@ -2101,14 +2609,20 @@ impl eframe::App for PoetApp {
         self.outline(ctx);
         self.rhyme_panel(ctx);
         self.editor(ctx);
+        if open_stress {
+            self.open_stress_at_cursor(ctx);
+        }
         self.dictionary_window(ctx);
         self.updates_window(ctx);
         self.history_window(ctx);
+        self.stress_window(ctx);
         self.pending_window(ctx);
         if self.smoke_test {
             self.smoke_update(ctx);
         }
-        if self.search_due.is_some()
+        if self.stress_due.is_some()
+            || self.stress_loading
+            || self.search_due.is_some()
             || self.autosave_due.is_some()
             || self.dictionary_loading
             || self.search_loading
@@ -2130,6 +2644,104 @@ impl eframe::App for PoetApp {
         }
         let _ = storage::save_recovery(&self.recovery_session());
     }
+}
+
+fn paint_stresses(
+    ui: &egui::Ui,
+    galley: &egui::Galley,
+    origin: egui::Pos2,
+    response: &egui::Response,
+    analysis: &stress::Analysis,
+) -> Option<(usize, Option<usize>, egui::Pos2)> {
+    let manual = Color32::from_rgb(113, 216, 199);
+    let pointer = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .filter(|_| response.hovered());
+    let mut hit = None;
+    let mut byte = 0;
+    let mut token_index = 0;
+    for row in &galley.rows {
+        if !ui
+            .clip_rect()
+            .intersects(row.rect.translate(origin.to_vec2()))
+        {
+            byte += row
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.chr.len_utf8())
+                .sum::<usize>()
+                + usize::from(row.ends_with_newline);
+            continue;
+        }
+        for glyph in &row.glyphs {
+            while analysis
+                .tokens
+                .get(token_index)
+                .is_some_and(|token| token.span.end <= byte)
+            {
+                token_index += 1;
+            }
+            if let Some(token) = analysis
+                .tokens
+                .get(token_index)
+                .filter(|token| token.span.contains(&byte))
+            {
+                let rect = glyph.logical_rect().translate(origin.to_vec2());
+                let vowel = token
+                    .vowels
+                    .iter()
+                    .position(|offset| *offset == byte - token.span.start);
+                let x = origin.x + glyph.pos.x + glyph.advance_width * 0.5;
+                if vowel.is_some()
+                    && vowel == token.selected
+                    && !token.word.contains('\u{301}')
+                    && !matches!(glyph.chr, 'ё' | 'Ё')
+                {
+                    let y = origin.y + row.rect.top();
+                    let color = if token.source == stress::Source::Manual {
+                        manual
+                    } else {
+                        ACCENT
+                    };
+                    ui.painter().line_segment(
+                        [egui::pos2(x - 1.0, y + 6.0), egui::pos2(x + 2.0, y + 2.0)],
+                        Stroke::new(1.5_f32, color),
+                    );
+                }
+                let y = origin.y + row.rect.bottom() - 3.0;
+                if token.source == stress::Source::Ambiguous {
+                    ui.painter().circle_filled(egui::pos2(x, y), 1.0, ACCENT);
+                } else if token.source == stress::Source::Unknown {
+                    ui.painter().line_segment(
+                        [egui::pos2(x - 1.5, y), egui::pos2(x + 1.5, y)],
+                        Stroke::new(1.0_f32, MUTED),
+                    );
+                } else if token.source == stress::Source::Manual && token.selected.is_none() {
+                    ui.painter().line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        Stroke::new(1.0_f32, manual),
+                    );
+                }
+                if pointer.is_some_and(|pos| rect.contains(pos)) {
+                    hit = Some((
+                        token.span.start,
+                        vowel,
+                        rect.left_bottom() + egui::vec2(-40.0, 10.0),
+                    ));
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    response.clone().on_hover_text(if vowel.is_some() {
+                        "Нажмите, чтобы поставить ударение на эту гласную"
+                    } else {
+                        "Нажмите, чтобы выбрать вариант ударения"
+                    });
+                }
+            }
+            byte += glyph.chr.len_utf8();
+        }
+        byte += usize::from(row.ends_with_newline);
+    }
+    hit
 }
 
 fn outline_link(ui: &mut egui::Ui, title: &str, active: bool, line: usize) -> egui::Response {
@@ -2297,6 +2909,78 @@ fn format_count(value: usize) -> String {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+
+    #[test]
+    fn stress_hit_test_matches_wrapped_cyrillic_vowel_coordinates() {
+        let ctx = egui::Context::default();
+        let original = "[Куплет]\nЭта длинная строка переносится: за́мок и замок.";
+        let mut text = original.to_owned();
+        let analysis = stress::analyze(&text, &[], None);
+        let start = text.rfind("замок").unwrap();
+        let vowel_byte = start + "зам".len();
+        let character = core::byte_to_char(&text, vowel_byte);
+        let mut run = |events: Vec<egui::Event>| {
+            let mut hit = None;
+            let mut clicked = false;
+            let mut target = egui::Pos2::ZERO;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(230.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut layouter = |ui: &egui::Ui, text: &str, width: f32| {
+                            let mut job = layout_poem(text, None);
+                            job.wrap.max_width = width;
+                            ui.fonts(|fonts| fonts.layout_job(job))
+                        };
+                        let output = egui::TextEdit::multiline(&mut text)
+                            .id(egui::Id::new("stress_test"))
+                            .desired_width(190.0)
+                            .layouter(&mut layouter)
+                            .show(ui);
+                        let cursor = output
+                            .galley
+                            .pos_from_ccursor(egui::text::CCursor::new(character))
+                            .translate(output.galley_pos.to_vec2());
+                        target = cursor.center() + egui::vec2(3.0, 0.0);
+                        hit = paint_stresses(
+                            ui,
+                            &output.galley,
+                            output.galley_pos,
+                            &output.response,
+                            &analysis,
+                        );
+                        clicked = output.response.clicked();
+                    });
+                },
+            );
+            (target, hit, clicked, output.platform_output.cursor_icon)
+        };
+        let (target, _, _, _) = run(vec![]);
+        let (_, hit, _, cursor) = run(vec![egui::Event::PointerMoved(target)]);
+        assert_eq!(hit.map(|hit| (hit.0, hit.1)), Some((start, Some(1))));
+        assert_eq!(cursor, egui::CursorIcon::PointingHand);
+        for pressed in [true, false] {
+            let (_, hit, clicked, _) = run(vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            if !pressed {
+                assert!(clicked);
+                assert_eq!(hit.unwrap().1, Some(1));
+            }
+        }
+        drop(run);
+        assert_eq!(text, original);
+    }
 
     #[test]
     fn outline_links_have_pointer_and_native_keyboard_activation() {
