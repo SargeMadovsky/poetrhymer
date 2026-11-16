@@ -9,7 +9,8 @@ use std::{
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
 
 use crate::{
-    core, formatter, history, history::Snapshot as DocumentState, lexicon::Lexicon, storage, stress,
+    core, formatter, history, history::Snapshot as DocumentState, lexicon::Lexicon, meter, storage,
+    stress,
 };
 
 const SAMPLE: &str = "[Куплет 1]\n«Где ты был, Семён Петрович?»\nТот ответил не спеша:\n«Поле было. Я работал.\nЗаготовил фуража».\n";
@@ -28,7 +29,7 @@ struct Selection {
 }
 
 enum Background {
-    Stress(u64, Arc<stress::Analysis>),
+    Stress(u64, Arc<stress::Analysis>, Arc<meter::Analysis>),
     Dictionary(u64, Result<(Arc<Lexicon>, Vec<String>), String>),
     Search(u64, Vec<core::Candidate>),
     UpdateCheck(Result<Option<crate::updater::Manifest>, String>),
@@ -53,6 +54,11 @@ pub struct PoetApp {
     history_entries: Vec<history::Summary>,
     history_selected: Option<String>,
     history_preview: Option<DocumentState>,
+    meter_mode: bool,
+    meter_scope: meter::Scope,
+    meter_line: Option<usize>,
+    meter_overrides: Vec<meter::Override>,
+    meter_analysis: Option<Arc<meter::Analysis>>,
     stress_mode: bool,
     stress_marks: Vec<stress::Mark>,
     stress_text: String,
@@ -138,6 +144,8 @@ impl PoetApp {
             compact_rhymes: false,
             stress_marks: Vec::new(),
             stress_mode: false,
+            meter_mode: false,
+            meter_overrides: Vec::new(),
         });
         let history_temp =
             smoke_test.then(|| tempfile::tempdir().expect("smoke-test history directory"));
@@ -155,6 +163,7 @@ impl PoetApp {
                         session.document_title = snapshot.title;
                         session.rhyme_links = snapshot.rhyme_links;
                         session.stress_marks = snapshot.stress_marks;
+                        session.meter_overrides = snapshot.meter_overrides;
                         recovered = true;
                         (summary.document, summary.path)
                     } else {
@@ -188,6 +197,11 @@ impl PoetApp {
             saved_text: Some(session.text.clone()),
             saved_title: session.document_title.clone(),
             document_title: session.document_title,
+            meter_mode: session.meter_mode,
+            meter_scope: meter::Scope::Section,
+            meter_line: None,
+            meter_overrides: session.meter_overrides,
+            meter_analysis: None,
             stress_mode: session.stress_mode,
             stress_marks: session.stress_marks,
             stress_text: session.text.clone(),
@@ -257,6 +271,7 @@ impl PoetApp {
         }
         app.rhyme_links.retain(|link| link.is_valid(&app.text));
         stress::retain_valid(&app.text, &mut app.stress_marks);
+        meter::retain_valid(&app.text, &mut app.meter_overrides);
         app.record_revision("Начало сессии");
         app.schedule_stress();
         if !recovered {
@@ -282,6 +297,8 @@ impl PoetApp {
             compact_rhymes: self.compact_rhymes,
             stress_marks: self.stress_marks.clone(),
             stress_mode: self.stress_mode,
+            meter_mode: self.meter_mode,
+            meter_overrides: self.meter_overrides.clone(),
         }
     }
 
@@ -639,7 +656,8 @@ impl PoetApp {
     fn receive_background(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
-                Background::Stress(ticket, analysis) if ticket == self.stress_ticket => {
+                Background::Stress(ticket, analysis, metrical) if ticket == self.stress_ticket => {
+                    self.meter_analysis = Some(metrical);
                     self.stress_loading = false;
                     self.stress_analysis = Some(analysis);
                 }
@@ -747,6 +765,7 @@ impl PoetApp {
 
     fn after_document_change(&mut self, reason: &str) {
         stress::rebase(&self.stress_text, &self.text, &mut self.stress_marks);
+        meter::rebase(&self.stress_text, &self.text, &mut self.meter_overrides);
         self.stress_text = self.text.clone();
         self.stress_selected = None;
         self.schedule_stress();
@@ -765,6 +784,7 @@ impl PoetApp {
             title: self.document_title.clone(),
             rhyme_links: self.rhyme_links.clone(),
             stress_marks: self.stress_marks.clone(),
+            meter_overrides: self.meter_overrides.clone(),
         }
     }
 
@@ -773,6 +793,8 @@ impl PoetApp {
         self.document_title = state.title;
         self.rhyme_links = state.rhyme_links;
         self.stress_marks = state.stress_marks;
+        self.meter_overrides = state.meter_overrides;
+        meter::retain_valid(&self.text, &mut self.meter_overrides);
         self.stress_text = self.text.clone();
         stress::retain_valid(&self.text, &mut self.stress_marks);
         self.stress_selected = None;
@@ -986,6 +1008,8 @@ impl PoetApp {
 
     fn replace_document(&mut self, text: String, path: Option<PathBuf>) {
         self.stress_marks.clear();
+        self.meter_overrides.clear();
+        self.meter_line = None;
         self.stress_text = text.clone();
         self.document_id = history::new_document();
         self.rhyme_links.clear();
@@ -1384,9 +1408,9 @@ impl PoetApp {
     fn schedule_stress(&mut self) {
         self.stress_ticket += 1;
         self.stress_analysis = None;
+        self.meter_analysis = None;
         self.stress_loading = false;
-        self.stress_due = self
-            .stress_mode
+        self.stress_due = (self.stress_mode || self.meter_mode)
             .then(|| Instant::now() + Duration::from_millis(80));
     }
 
@@ -1401,7 +1425,12 @@ impl PoetApp {
         self.stress_loading = true;
         std::thread::spawn(move || {
             let analysis = stress::analyze(&text, &marks, lexicon.as_deref());
-            let _ = tx.send(Background::Stress(ticket, Arc::new(analysis)));
+            let metrical = meter::analyze(&text, &analysis);
+            let _ = tx.send(Background::Stress(
+                ticket,
+                Arc::new(analysis),
+                Arc::new(metrical),
+            ));
             ctx.request_repaint();
         });
     }
@@ -1440,6 +1469,7 @@ impl PoetApp {
             word = vowel.map_or_else(|| stress::clean(&word), |v| stress::accented(&word, v));
             self.text.replace_range(token.span, &word);
             stress::rebase(&self.stress_text, &self.text, &mut self.stress_marks);
+            meter::rebase(&self.stress_text, &self.text, &mut self.meter_overrides);
             self.stress_text = self.text.clone();
         }
         self.stress_marks.push(stress::Mark { start, word, vowel });
@@ -1629,6 +1659,287 @@ impl PoetApp {
         }
     }
 
+    fn set_meter_override(&mut self, index: usize, choice: meter::Choice, feet: Option<usize>) {
+        let Some((start, guard)) = meter::anchor(&self.text, index, self.meter_scope) else {
+            return;
+        };
+        let feet = if matches!(choice, meter::Choice::Regular(_)) {
+            feet.map(|n| n.clamp(1, 32))
+        } else {
+            None
+        };
+        let old = self.meter_overrides.iter().find(|item| {
+            item.scope == self.meter_scope && item.start == start && item.guard == guard
+        });
+        if old.is_none() && choice == meter::Choice::Auto {
+            return;
+        }
+        if old.is_some_and(|item| item.choice == choice && item.feet == feet) {
+            return;
+        }
+        self.push_undo(self.snapshot());
+        self.last_typing = None;
+        self.meter_overrides.retain(|item| {
+            !(item.scope == self.meter_scope && item.start == start && item.guard == guard)
+        });
+        if choice != meter::Choice::Auto {
+            self.meter_overrides.push(meter::Override {
+                scope: self.meter_scope,
+                start,
+                guard,
+                choice,
+                feet,
+            });
+        }
+        self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+        self.record_revision("Ручная модель размера");
+        self.set_status("Модель размера обновлена. Ctrl+Z — отменить.", false);
+    }
+
+    fn inspect_meter_syllable(&mut self, byte: usize, ctx: &egui::Context) {
+        if let Some(word) = stress::word_at(&self.text, byte) {
+            self.stress_mode = true;
+            self.stress_selected = Some(word.start);
+            self.stress_popup_pos = ctx.screen_rect().center() - egui::vec2(150.0, 80.0);
+            self.stress_focus = true;
+            self.navigate_to(byte);
+            self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+        }
+    }
+
+    fn meter_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(analysis) = self.meter_analysis.clone() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Анализируем размер…");
+            });
+            return;
+        };
+        let Some(line) = self
+            .meter_line
+            .and_then(|index| {
+                analysis
+                    .line(index)
+                    .or_else(|| analysis.lines.iter().find(|line| line.index >= index))
+            })
+            .or_else(|| analysis.lines.first())
+        else {
+            ui.label("Добавьте стихотворные строки для анализа размера.");
+            return;
+        };
+        let section = &analysis.sections[line.section];
+        let own = meter::anchor(&self.text, line.index, self.meter_scope)
+            .and_then(|(start, guard)| {
+                self.meter_overrides.iter().find(|item| {
+                    item.scope == self.meter_scope && item.start == start && item.guard == guard
+                })
+            })
+            .cloned();
+        let mut choice = own.as_ref().map_or(meter::Choice::Auto, |item| item.choice);
+        let mut feet = own.as_ref().and_then(|item| item.feet);
+        let old = (choice, feet);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("Размер · строка {}", line.index + 1)).strong());
+            egui::ComboBox::from_id_salt("meter_scope")
+                .width(110.0)
+                .selected_text(if self.meter_scope == meter::Scope::Section {
+                    "Для секции"
+                } else {
+                    "Для строки"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.meter_scope, meter::Scope::Section, "Для секции");
+                    ui.selectable_value(&mut self.meter_scope, meter::Scope::Line, "Для строки");
+                });
+            egui::ComboBox::from_id_salt("meter_model")
+                .width(170.0)
+                .selected_text(choice.name())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, meter::Choice::Auto, "Авто");
+                    for model in meter::Meter::ALL {
+                        ui.selectable_value(
+                            &mut choice,
+                            meter::Choice::Regular(model),
+                            format!("{}  {}", model.name(), model.pattern()),
+                        );
+                    }
+                    ui.selectable_value(&mut choice, meter::Choice::Free, "Свободный / смешанный");
+                });
+            if let meter::Choice::Regular(model) = choice {
+                let mut custom = feet.is_some();
+                let mut count = feet
+                    .unwrap_or_else(|| meter::fit(line, model, None).feet)
+                    .clamp(1, 32);
+                let toggled = ui
+                    .checkbox(&mut custom, "Стоп")
+                    .on_hover_text("Задать число стоп для выбранной области")
+                    .changed();
+                let changed = ui
+                    .add_enabled(custom, egui::DragValue::new(&mut count).range(1..=32))
+                    .changed();
+                if toggled || changed {
+                    feet = custom.then_some(count);
+                }
+            } else {
+                feet = None;
+            }
+        });
+        if (choice, feet) != old {
+            self.set_meter_override(line.index, choice, feet);
+        }
+        let (detected, feet) = analysis.model(&self.text, line.index, &self.meter_overrides);
+        let manual = meter::resolve(&self.text, line.index, &self.meter_overrides);
+        let provenance = manual.map_or(
+            if matches!(section.detected, meter::Detection::Regular(_)) {
+                "авто секции"
+            } else {
+                "авто строки"
+            },
+            |item| {
+                if item.scope == meter::Scope::Line {
+                    "задано для строки"
+                } else {
+                    "задано для секции"
+                }
+            },
+        );
+        ui.label(
+            RichText::new(format!(
+                "Авто: секция «{}» — {} · строка — {}",
+                section.name,
+                section.detected.name(),
+                line.detected.name()
+            ))
+            .small()
+            .color(MUTED),
+        )
+        .on_hover_text(format!(
+            "Заголовок секции: позиция {}. Автоматические оценки не переписывают ударения.",
+            section.start
+        ));
+        let selected = if let meter::Detection::Regular(model) = detected {
+            Some(meter::fit(line, model, feet))
+        } else {
+            None
+        };
+        if let Some(fit) = &selected {
+            let estimate = if line.coverage < 0.55 || line.anchors < 2 {
+                "недостаточно подтверждённых ударений"
+            } else if line.uncertain_words > 0 {
+                "есть неоднозначные слова"
+            } else if fit.score >= 0.95 && line.anchors >= 3 {
+                "хорошее соответствие"
+            } else if fit.score >= 0.82 {
+                "возможный вариант"
+            } else {
+                "заметные отклонения"
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{} · стоп: {} · {} · {}",
+                    fit.meter.name(),
+                    fit.feet,
+                    provenance,
+                    estimate
+                ))
+                .color(ACCENT),
+            );
+            ui.label(RichText::new(format!("Вне схемы: {} · пропущенных сильных позиций: {} · неподтверждённых слов: {}{}",fit.extra.len(),fit.missing.len(),line.uncertain_words,if fit.length_mismatch {" · длина не соответствует числу стоп"}else{""})).small().color(MUTED))
+                .on_hover_text("Пропуски сильных позиций бывают допустимым ритмическим вариантом. Совпадение с моделью — эвристическая оценка, не вероятность правильного ответа.");
+        } else {
+            ui.label(RichText::new(format!("{} · {}", detected.name(), provenance)).color(ACCENT));
+        }
+        let fallback = line.candidates.first();
+        if let Some(fit) = selected.as_ref().or(fallback) {
+            egui::ScrollArea::horizontal()
+                .id_salt("meter_scansion")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([60.0, 24.0], egui::Label::new("Факт:"));
+                        for (i, byte) in line.vowels.iter().enumerate() {
+                            let uncertain = fit.uncertain[i] || fit.actual[i].is_none();
+                            let symbol = if uncertain {
+                                "?"
+                            } else if fit.actual[i] == Some(true) {
+                                "—"
+                            } else {
+                                "∪"
+                            };
+                            let color = if uncertain {
+                                MUTED
+                            } else if selected.is_some() && fit.extra.contains(&i) {
+                                Color32::LIGHT_RED
+                            } else if selected.is_some() && fit.missing.contains(&i) {
+                                ACCENT
+                            } else {
+                                INK
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(symbol).monospace().size(16.0).color(color),
+                                    )
+                                    .frame(false)
+                                    .min_size(egui::vec2(24.0, 24.0)),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(format!("Слог {} — выбрать ударение слова", i + 1))
+                                .clicked()
+                            {
+                                self.inspect_meter_syllable(*byte, ctx);
+                            }
+                        }
+                    });
+                    if selected.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([60.0, 24.0], egui::Label::new("Схема:"));
+                            for strong in &fit.expected {
+                                ui.add_sized(
+                                    [24.0, 24.0],
+                                    egui::Label::new(
+                                        RichText::new(if *strong { "—" } else { "∪" })
+                                            .monospace()
+                                            .size(16.0)
+                                            .color(if *strong { ACCENT } else { MUTED }),
+                                    ),
+                                );
+                            }
+                        });
+                    }
+                });
+        }
+        ui.label(RichText::new("? — ударение не зафиксировано, включая контекстные односложные слова · нажмите слог для уточнения").small().color(MUTED));
+        egui::CollapsingHeader::new("Другие модели").id_salt("meter_alternatives").show(ui,|ui| {
+            ui.horizontal_wrapped(|ui| { for fit in &line.candidates {
+                let label=if line.coverage>=0.55 && line.anchors>=2 {format!("{} · {}%",fit.meter.name(),(fit.score*100.0).round())}else{fit.meter.name().into()};
+                if ui.button(label).on_hover_text("Сравнение с моделью для этой строки; нажмите, чтобы выбрать её для указанной области").clicked() {self.set_meter_override(line.index,meter::Choice::Regular(fit.meter),None);}
+            }});
+        });
+        egui::CollapsingHeader::new("Строки секции")
+            .id_salt("meter_section_lines")
+            .show(ui, |ui| {
+                for index in &section.lines {
+                    let item = &analysis.lines[*index];
+                    let (model, _) = analysis.model(&self.text, item.index, &self.meter_overrides);
+                    if ui
+                        .selectable_label(
+                            item.index == line.index,
+                            format!(
+                                "{} · {} · {} слогов",
+                                item.index + 1,
+                                model.name(),
+                                item.vowels.len()
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.meter_line = Some(item.index);
+                        self.navigate_to(item.start);
+                    }
+                }
+            });
+    }
+
     fn editor(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(
@@ -1637,6 +1948,13 @@ impl PoetApp {
                     .inner_margin(28.0),
             )
             .show(ctx, |ui| {
+                if self.meter_mode {
+                    egui::TopBottomPanel::bottom("verse_meter_panel").resizable(true).default_height(270.0).min_height(170.0).max_height(350.0)
+                        .frame(egui::Frame::new().fill(Color32::from_rgb(20,27,39)).inner_margin(egui::Margin::symmetric(0,8)))
+                        .show_separator_line(true).show_inside(ui,|ui| {
+                            egui::ScrollArea::vertical().id_salt("meter_panel_content").auto_shrink([false,false]).show(ui,|ui|self.meter_panel(ui,ctx));
+                        });
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("ВАШ ТЕКСТ").size(11.0).strong().color(MUTED));
                     ui.add_space(8.0);
@@ -1658,8 +1976,13 @@ impl PoetApp {
                         self.schedule_stress();
                         self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
                     }
+                    if ui.selectable_label(self.meter_mode,"Размер").on_hover_text("Анализ размера выбранной строки и секции").clicked() {
+                        self.meter_mode=!self.meter_mode;
+                        self.schedule_stress();
+                        self.autosave_due=Some(Instant::now()+Duration::from_millis(800));
+                    }
                     if self.stress_mode && ui.add_enabled(self.stress_analysis.is_some(), egui::Button::new("Экспорт с ударениями").wrap_mode(egui::TextWrapMode::Extend)).clicked() { self.export_stress(); }
-                    if !self.stress_mode && ui.available_rect_before_wrap().width() > 300.0 {
+                    if !self.stress_mode && !self.meter_mode && ui.available_rect_before_wrap().width() > 300.0 {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(RichText::new("Последние слова — точки для новых рифм").size(12.0).color(MUTED));
                         });
@@ -1771,6 +2094,12 @@ impl PoetApp {
                                 stress_hit = paint_stresses(ui, &output.galley, output.galley_pos, &output.response, analysis);
                             }
                         }
+                        if let Some(range)=output.cursor_range {
+                            let byte=core::char_to_byte(&self.text,range.primary.ccursor.index);
+                            if let Some(line)=core::parse_lines(&self.text).iter().find(|line|line.span.start<=byte && byte<=line.span.end) {
+                                if self.meter_line!=Some(line.index) {self.meter_line=Some(line.index);ctx.request_repaint();}
+                            }
+                        }
                         let numbers = core::verse_numbers(&self.text);
                         // Track the section at the top reading edge, including wrapped lines.
                         // Include the first line's height: the scroll clip can start
@@ -1796,6 +2125,16 @@ impl PoetApp {
                             }
                             first_row = row.ends_with_newline;
                             if row.ends_with_newline { line += 1; }
+                        }
+                        if self.meter_mode && !output.response.changed() {
+                            if let Some(analysis)=&self.meter_analysis {
+                                if let Some(line)=self.meter_line.and_then(|index|analysis.line(index)).or_else(||analysis.lines.first()) {
+                                    if let (meter::Detection::Regular(model),feet)=analysis.model(&self.text,line.index,&self.meter_overrides) {
+                                        let fit=meter::fit(line,model,feet);
+                                        paint_meter_deviations(ui,&output.galley,output.galley_pos,line,&fit);
+                                    }
+                                }
+                            }
                         }
                         if let Some(cursor) = self.requested_scroll.take() {
                             let rect = output.galley.pos_from_ccursor(egui::text::CCursor::new(cursor))
@@ -2064,6 +2403,16 @@ impl PoetApp {
                 finish(ctx, Err("багажа missing from candidates".into()));
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
+            if std::env::args().any(|arg| arg == "--smoke-meter") {
+                self.replace_document("[Куплет 1]\nМой дя́дя са́мых че́стных пра́вил,\nКогда́ не в шу́тку занемо́г,\n[Припев]\nМа́ма ма́ма ма́ма ма́ма\n".into(),None);
+                self.meter_mode = true;
+                self.stress_mode = false;
+                self.meter_line = Some(1);
+                self.navigate_to(self.text.find("Когда́").unwrap());
+                self.schedule_stress();
+                self.smoke_stage = 21;
+                return;
+            }
             if std::env::args().any(|arg| arg == "--smoke-stress") {
                 self.replace_document("[Куплет 1]\nСтарый замок на горе,\nЁжик прячется в траве.\nФыжобряк тихонько дышит,\nОблачённый ветром слышит.\n".into(), None);
                 self.stress_mode = true;
@@ -2163,6 +2512,61 @@ impl PoetApp {
             self.set_status("Проверено: словарь, поиск, замена, отмена и повтор.", false);
             self.smoke_started = Instant::now();
             self.smoke_stage = 2;
+        } else if self.smoke_stage == 21 && self.meter_analysis.is_some() {
+            let analysis = self.meter_analysis.clone().unwrap();
+            if analysis.line(1).unwrap().detected != meter::Detection::Regular(meter::Meter::Iamb)
+                || analysis.line(4).unwrap().detected
+                    != meter::Detection::Regular(meter::Meter::Trochee)
+            {
+                finish(ctx, Err("meter auto classification mismatch".into()));
+                return;
+            }
+            let before = self.text.clone();
+            self.meter_scope = meter::Scope::Section;
+            self.set_meter_override(2, meter::Choice::Regular(meter::Meter::Amphibrach), Some(3));
+            self.meter_scope = meter::Scope::Line;
+            self.set_meter_override(2, meter::Choice::Regular(meter::Meter::Iamb), Some(4));
+            if analysis.model(&self.text, 2, &self.meter_overrides).0
+                != meter::Detection::Regular(meter::Meter::Iamb)
+            {
+                finish(ctx, Err("line override did not take priority".into()));
+                return;
+            }
+            self.undo();
+            if analysis.model(&self.text, 2, &self.meter_overrides).0
+                != meter::Detection::Regular(meter::Meter::Amphibrach)
+            {
+                finish(ctx, Err("meter undo did not restore section model".into()));
+                return;
+            }
+            self.redo();
+            if self.text != before || self.meter_overrides.len() != 2 {
+                finish(ctx, Err("meter redo changed text or lost overrides".into()));
+                return;
+            }
+            let session: storage::Session =
+                serde_json::from_slice(&serde_json::to_vec(&self.recovery_session()).unwrap())
+                    .unwrap();
+            if session.meter_overrides != self.meter_overrides || !session.meter_mode {
+                finish(ctx, Err("meter recovery roundtrip failed".into()));
+                return;
+            }
+            self.stress_analysis = Some(Arc::new(stress::analyze(
+                &self.text,
+                &self.stress_marks,
+                self.lexicon.as_deref(),
+            )));
+            self.meter_analysis = Some(Arc::new(meter::analyze(
+                &self.text,
+                self.stress_analysis.as_deref().unwrap(),
+            )));
+            self.meter_line = Some(2);
+            self.set_status(
+                "Проверено: размер, секции, приоритет строки, отмена/повтор и восстановление.",
+                false,
+            );
+            self.smoke_started = Instant::now();
+            self.smoke_stage = 2;
         } else if self.smoke_stage == 18 && self.stress_analysis.is_some() {
             let start = self.text.find("замок").unwrap();
             let before = self.text.clone();
@@ -2236,6 +2640,7 @@ impl PoetApp {
                 title: None,
                 rhyme_links: vec![],
                 stress_marks: vec![],
+                meter_overrides: vec![],
             });
             self.stress_analysis = Some(Arc::new(stress::analyze(
                 &self.text,
@@ -2643,6 +3048,55 @@ impl eframe::App for PoetApp {
             return;
         }
         let _ = storage::save_recovery(&self.recovery_session());
+    }
+}
+
+fn paint_meter_deviations(
+    ui: &egui::Ui,
+    galley: &egui::Galley,
+    origin: egui::Pos2,
+    line: &meter::Line,
+    fit: &meter::Fit,
+) {
+    let mut byte = 0;
+    for row in &galley.rows {
+        if !ui
+            .clip_rect()
+            .intersects(row.rect.translate(origin.to_vec2()))
+        {
+            byte += row
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.chr.len_utf8())
+                .sum::<usize>()
+                + usize::from(row.ends_with_newline);
+            continue;
+        }
+        for glyph in &row.glyphs {
+            if let Ok(index) = line.vowels.binary_search(&byte) {
+                if !fit.uncertain[index] {
+                    let color = if fit.extra.contains(&index) {
+                        Some(Color32::LIGHT_RED)
+                    } else if fit.missing.contains(&index) {
+                        Some(ACCENT)
+                    } else {
+                        None
+                    };
+                    if let Some(color) = color {
+                        let y = origin.y + row.rect.bottom() - 2.0;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(origin.x + glyph.pos.x, y),
+                                egui::pos2(origin.x + glyph.pos.x + glyph.advance_width, y),
+                            ],
+                            Stroke::new(2.0_f32, color),
+                        );
+                    }
+                }
+            }
+            byte += glyph.chr.len_utf8();
+        }
+        byte += usize::from(row.ends_with_newline);
     }
 }
 

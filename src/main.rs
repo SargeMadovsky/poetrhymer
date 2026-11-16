@@ -4,6 +4,7 @@ mod core;
 mod formatter;
 mod history;
 mod lexicon;
+mod meter;
 mod storage;
 mod stress;
 mod ui;

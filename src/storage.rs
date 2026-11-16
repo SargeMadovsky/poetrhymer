@@ -21,7 +21,11 @@ pub struct Session {
     #[serde(default)]
     pub stress_marks: Vec<crate::stress::Mark>,
     #[serde(default)]
+    pub meter_overrides: Vec<crate::meter::Override>,
+    #[serde(default)]
     pub stress_mode: bool,
+    #[serde(default)]
+    pub meter_mode: bool,
 }
 
 /// A recovered draft is already safe in local recovery. For a named file,
@@ -166,6 +170,8 @@ mod tests {
         assert!(session.file_path.is_none());
         assert!(!session.compact_rhymes);
         assert!(!session.stress_mode);
+        assert!(!session.meter_mode);
+        assert!(session.meter_overrides.is_empty());
         assert!(session.stress_marks.is_empty());
     }
 
@@ -188,12 +194,22 @@ mod tests {
                 vowel: Some(0),
             }],
             stress_mode: true,
+            meter_mode: true,
+            meter_overrides: vec![crate::meter::Override {
+                scope: crate::meter::Scope::Line,
+                start: 0,
+                guard: Some("Первая строка\r".into()),
+                choice: crate::meter::Choice::Regular(crate::meter::Meter::Trochee),
+                feet: Some(3),
+            }],
         };
         let restored: Session =
             serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
         assert_eq!(restored.file_path, Some(path.clone()));
         assert!(restored.compact_rhymes);
         assert!(restored.stress_mode);
+        assert!(restored.meter_mode);
+        assert_eq!(restored.meter_overrides, session.meter_overrides);
         assert_eq!(restored.stress_marks, session.stress_marks);
         let baseline = saved_text_after_recovery(&restored.text, restored.file_path.as_deref());
         assert_eq!(baseline.as_deref(), Some(restored.text.as_str()));

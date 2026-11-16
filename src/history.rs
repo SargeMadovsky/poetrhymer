@@ -20,6 +20,8 @@ pub struct Snapshot {
     pub rhyme_links: Vec<crate::core::RhymeLink>,
     #[serde(default)]
     pub stress_marks: Vec<crate::stress::Mark>,
+    #[serde(default)]
+    pub meter_overrides: Vec<crate::meter::Override>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -336,6 +338,7 @@ mod tests {
             title: Some("Песня".into()),
             rhyme_links: vec![],
             stress_marks: vec![],
+            meter_overrides: vec![],
         }
     }
 
@@ -431,6 +434,13 @@ mod tests {
             word: "Замок".into(),
             vowel: Some(1),
         });
+        state.meter_overrides.push(crate::meter::Override {
+            scope: crate::meter::Scope::Line,
+            start: 0,
+            guard: Some("Замок".into()),
+            choice: crate::meter::Choice::Regular(crate::meter::Meter::Iamb),
+            feet: Some(2),
+        });
         history.record("first", state, Some(path.clone()), "Ручное ударение");
         history.shutdown();
         let (history, _, _) = History::open(dir.path().into(), || {}).unwrap();
@@ -439,6 +449,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(metadata.stress_marks[0].vowel, Some(1));
+        assert_eq!(metadata.meter_overrides[0].feet, Some(2));
         assert!(history
             .file_metadata(path, "Новый замок".into())
             .unwrap()
