@@ -78,6 +78,59 @@ pub fn parse_lines(text: &str) -> Vec<LineInfo> {
         .collect()
 }
 
+/// Visual positions in groups of four; absolute line indices remain stable IDs.
+pub fn verse_numbers(text: &str) -> Vec<Option<usize>> {
+    let mut next = 0;
+    parse_lines(text)
+        .iter()
+        .map(|line| {
+            if line.section.is_some() || text[line.span.clone()].trim().is_empty() {
+                next = 0;
+                None
+            } else if line.last_word.is_some() {
+                let number = next % 4 + 1;
+                next += 1;
+                Some(number)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub fn line_label(text: &str, index: usize) -> String {
+    match verse_numbers(text).get(index).copied().flatten() {
+        Some(number) => format!("{number} · строка {}", index + 1),
+        None => format!("строка {}", index + 1),
+    }
+}
+
+#[cfg(test)]
+mod numbering_tests {
+    #[test]
+    fn numbering_restarts_at_stanzas_sections_and_after_four_lines() {
+        let text = "[Куплет]\nРаз\nДва\nТри\nЧетыре\nПять\n\nСнова\n[Припев]\nЁж\n";
+        assert_eq!(
+            super::verse_numbers(text),
+            vec![
+                None,
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(1),
+                None,
+                Some(1),
+                None,
+                Some(1),
+                None
+            ]
+        );
+        assert_eq!(super::line_label(text, 9), "1 · строка 10");
+        assert_eq!(text.lines().nth(9), Some("Ёж"));
+    }
+}
+
 /// Suggest a partner only within the current stanza. This lightweight suffix
 /// heuristic is a visible suggestion, not an inferred mandatory rhyme scheme.
 pub fn suggest_anchor(text: &str, selected: usize) -> Option<usize> {

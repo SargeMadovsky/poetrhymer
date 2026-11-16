@@ -12,6 +12,38 @@ pub struct Session {
     pub dictionary_folder: String,
     #[serde(default)]
     pub rhyme_links: Vec<crate::core::RhymeLink>,
+    #[serde(default)]
+    pub last_document_folder: Option<PathBuf>,
+}
+
+pub fn documents_directory() -> PathBuf {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            System::Com::CoTaskMemFree,
+            UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath},
+        };
+        let mut value = std::ptr::null_mut();
+        if SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut value) >= 0
+            && !value.is_null()
+        {
+            let mut len = 0;
+            while *value.add(len) != 0 {
+                len += 1;
+            }
+            use std::os::windows::ffi::OsStringExt;
+            let path = PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+                value, len,
+            )));
+            CoTaskMemFree(value.cast());
+            return path;
+        }
+    }
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .map(|path| path.join("Documents"))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn default_dictionary_folder() -> PathBuf {
@@ -43,12 +75,15 @@ pub fn app_directory() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn recovery_path() -> PathBuf {
-    // Keep the prototype portable and all user data beside the project/executable.
+pub fn data_directory() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(app_directory)
-        .join("Poetrhymer/data/recovery.json")
+        .join("Poetrhymer/data")
+}
+
+fn recovery_path() -> PathBuf {
+    data_directory().join("recovery.json")
 }
 
 pub fn load_recovery() -> Option<Session> {

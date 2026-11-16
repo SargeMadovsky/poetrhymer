@@ -8,7 +8,9 @@ use std::{
 
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, TextFormat};
 
-use crate::{core, formatter, lexicon::Lexicon, storage};
+use crate::{
+    core, formatter, history, history::Snapshot as DocumentState, lexicon::Lexicon, storage,
+};
 
 const SAMPLE: &str = "[Куплет 1]\n«Где ты был, Семён Петрович?»\nТот ответил не спеша:\n«Поле было. Я работал.\nЗаготовил фуража».\n";
 const FORMAT_DRAFT: &str = "# «Тракторист Семён Петров»\n\n**Куплет 1**\nНа рассвете над **полями**  \nИ выходит вместе с *нами*\\\n\n***Припев***\nПой!\n";
@@ -36,21 +38,26 @@ enum PendingAction {
     New,
     Open(PathBuf),
     Close,
-}
-
-#[derive(Clone)]
-struct DocumentState {
-    text: String,
-    title: Option<String>,
-    rhyme_links: Vec<core::RhymeLink>,
+    CopyRevision(DocumentState),
 }
 
 pub struct PoetApp {
+    history: Option<history::History>,
+    _history_temp: Option<tempfile::TempDir>,
+    document_id: String,
+    history_error: Option<String>,
+    show_history: bool,
+    history_all: bool,
+    history_limit: usize,
+    history_entries: Vec<history::Summary>,
+    history_selected: Option<String>,
+    history_preview: Option<DocumentState>,
     text: String,
     saved_text: String,
     saved_title: Option<String>,
     document_title: Option<String>,
     file_path: Option<PathBuf>,
+    last_document_folder: Option<PathBuf>,
     revision: u64,
     undo: Vec<DocumentState>,
     redo: Vec<DocumentState>,
@@ -83,6 +90,8 @@ pub struct PoetApp {
     pending_action: Option<PendingAction>,
     allow_close: bool,
     requested_cursor: Option<usize>,
+    requested_scroll: Option<usize>,
+    editor_scroll: f32,
     update_busy: bool,
     update_available: Option<crate::updater::Manifest>,
     update_message: String,
@@ -102,14 +111,38 @@ impl PoetApp {
         } else {
             storage::load_recovery()
         };
-        let recovered = recovery.is_some();
+        let mut recovered = recovery.is_some();
         let default_folder = storage::default_dictionary_folder();
         let mut session = recovery.unwrap_or_else(|| storage::Session {
             text: SAMPLE.to_owned(),
             document_title: None,
             dictionary_folder: default_folder.to_string_lossy().into_owned(),
             rhyme_links: Vec::new(),
+            last_document_folder: None,
         });
+        let history_temp =
+            smoke_test.then(|| tempfile::tempdir().expect("smoke-test history directory"));
+        let history_path = history_temp
+            .as_ref()
+            .map(|dir| dir.path().to_owned())
+            .unwrap_or_else(|| storage::data_directory().join("history"));
+        let repaint = cc.egui_ctx.clone();
+        let (history, document_id, file_path, history_error) =
+            match history::History::open(history_path, move || repaint.request_repaint()) {
+                Ok((history, previous, warning)) => {
+                    let (document, path) = if let Some((summary, snapshot)) = previous {
+                        session.text = snapshot.text;
+                        session.document_title = snapshot.title;
+                        session.rhyme_links = snapshot.rhyme_links;
+                        recovered = true;
+                        (summary.document, summary.path)
+                    } else {
+                        (history::new_document(), None)
+                    };
+                    (Some(history), document, path, warning)
+                }
+                Err(error) => (None, history::new_document(), None, Some(error)),
+            };
         let saved_folder = PathBuf::from(&session.dictionary_folder);
         let legacy_default = storage::app_directory().join("Rhymes 3");
         if session.dictionary_folder.trim().is_empty()
@@ -121,6 +154,16 @@ impl PoetApp {
         }
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
+            history,
+            _history_temp: history_temp,
+            document_id,
+            history_error,
+            show_history: false,
+            history_all: false,
+            history_limit: 200,
+            history_entries: Vec::new(),
+            history_selected: None,
+            history_preview: None,
             saved_text: if recovered {
                 String::new()
             } else {
@@ -133,7 +176,8 @@ impl PoetApp {
             },
             document_title: session.document_title,
             text: session.text,
-            file_path: None,
+            file_path,
+            last_document_folder: session.last_document_folder,
             revision: 0,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -170,6 +214,8 @@ impl PoetApp {
             pending_action: None,
             allow_close: false,
             requested_cursor: None,
+            requested_scroll: None,
+            editor_scroll: 0.0,
             update_busy: false,
             update_available: None,
             update_message: String::new(),
@@ -180,6 +226,7 @@ impl PoetApp {
             smoke_started: Instant::now(),
         };
         app.rhyme_links.retain(|link| link.is_valid(&app.text));
+        app.record_revision("Начало сессии");
         if !recovered {
             if let Some(at) = app.text.find("фуража") {
                 app.select_word(at);
@@ -190,6 +237,217 @@ impl PoetApp {
             app.check_updates(&cc.egui_ctx);
         }
         app
+    }
+
+    fn record_revision(&mut self, reason: &str) {
+        let snapshot = self.snapshot();
+        if let Some(history) = &mut self.history {
+            history.record(&self.document_id, snapshot, self.file_path.clone(), reason);
+        }
+    }
+
+    fn receive_history(&mut self) {
+        let events: Vec<_> = self
+            .history
+            .as_ref()
+            .map(|history| history.rx.try_iter().collect())
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                history::Event::Saved => {
+                    if let Some(history) = &mut self.history {
+                        history.pending = history.pending.saturating_sub(1);
+                    }
+                    if self
+                        .history_error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("Не удалось записать историю"))
+                    {
+                        self.history_error = None;
+                    }
+                }
+                history::Event::Error(error) => self.history_error = Some(error),
+                history::Event::Catalogue(entries) => self.history_entries = entries,
+                history::Event::Preview(id, snapshot) => {
+                    if self.history_selected.as_deref() == Some(&id) {
+                        self.history_preview = Some(snapshot);
+                    }
+                }
+            }
+        }
+    }
+
+    fn history_window(&mut self, ctx: &egui::Context) {
+        if !self.show_history {
+            return;
+        }
+        let mut open = true;
+        let mut restore = None;
+        egui::Window::new("История правок")
+            .open(&mut open)
+            .default_size([830.0, 580.0])
+            .default_pos(egui::pos2(220.0, 90.0))
+            .min_size([600.0, 360.0])
+            .max_size(ctx.screen_rect().size() - egui::vec2(40.0, 40.0))
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.set_min_width((ctx.screen_rect().width() - 80.0).clamp(520.0, 800.0));
+                ui.label(
+                    "Версии хранятся на этом компьютере. Восстановление добавляет новую правку.",
+                );
+                if let Some(error) = &self.history_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.history_all, "Все документы и сеансы")
+                        .changed()
+                    {
+                        self.history_limit = 200;
+                        self.history_selected = None;
+                        self.history_preview = None;
+                    }
+                    if ui.button("Обновить список").clicked() {
+                        if let Some(history) = &self.history {
+                            history.catalogue();
+                        }
+                    }
+                    if self.history.as_ref().is_some_and(|h| h.pending > 0) {
+                        ui.spinner();
+                        ui.label("Записываем правки…");
+                    }
+                });
+                ui.separator();
+                let selected_summary = self
+                    .history_entries
+                    .iter()
+                    .find(|entry| Some(&entry.id) == self.history_selected.as_ref())
+                    .cloned();
+                let height = (ctx.screen_rect().height() - 290.0).clamp(160.0, 420.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(280.0, height),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("revision_list")
+                                .max_height(height)
+                                .show(ui, |ui| {
+                                    let entries: Vec<_> = self
+                                        .history_entries
+                                        .iter()
+                                        .filter(|entry| {
+                                            self.history_all || entry.document == self.document_id
+                                        })
+                                        .collect();
+                                    if entries.is_empty() {
+                                        ui.label("Список пока пуст. Обновите после записи правок.");
+                                    }
+                                    for entry in entries.iter().take(self.history_limit) {
+                                        let label = format!(
+                                            "{} · {}\n{} · {} знаков",
+                                            revision_date(entry.time),
+                                            entry.title,
+                                            entry.reason,
+                                            entry.chars
+                                        );
+                                        if ui
+                                            .selectable_label(
+                                                self.history_selected.as_ref() == Some(&entry.id),
+                                                label,
+                                            )
+                                            .clicked()
+                                        {
+                                            self.history_selected = Some(entry.id.clone());
+                                            self.history_preview = None;
+                                            if let Some(history) = &self.history {
+                                                history.preview(&entry.id);
+                                            }
+                                        }
+                                    }
+                                    if entries.len() > self.history_limit
+                                        && ui.button("Показать ещё 200").clicked()
+                                    {
+                                        self.history_limit += 200;
+                                    }
+                                });
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width().max(200.0), height),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            if let (Some(summary), Some(snapshot)) =
+                                (&selected_summary, &self.history_preview)
+                            {
+                                ui.label(RichText::new(&summary.title).strong());
+                                if let Some(path) = &summary.path {
+                                    ui.label(
+                                        RichText::new(path.display().to_string())
+                                            .small()
+                                            .color(MUTED),
+                                    );
+                                }
+                                egui::ScrollArea::both()
+                                    .id_salt("revision_preview")
+                                    .max_height(height - 70.0)
+                                    .show(ui, |ui| {
+                                        let mut text = snapshot.text.as_str();
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut text)
+                                                .desired_width(ui.available_width())
+                                                .font(egui::TextStyle::Monospace),
+                                        );
+                                    });
+                            } else {
+                                ui.label("Выберите версию для просмотра.");
+                            }
+                        },
+                    );
+                });
+                ui.separator();
+                let current = selected_summary
+                    .as_ref()
+                    .is_some_and(|s| s.document == self.document_id);
+                if ui
+                    .add_enabled(
+                        self.history_preview.is_some(),
+                        egui::Button::new(if current {
+                            "Восстановить эту версию"
+                        } else {
+                            "Открыть версию как новый текст"
+                        }),
+                    )
+                    .clicked()
+                {
+                    restore = self
+                        .history_preview
+                        .clone()
+                        .map(|snapshot| (current, snapshot));
+                }
+            });
+        self.show_history = open;
+        if let Some((current, snapshot)) = restore {
+            if current {
+                self.restore_version(snapshot);
+            } else {
+                self.request_action(PendingAction::CopyRevision(snapshot), ctx);
+            }
+            self.show_history = false;
+        }
+    }
+
+    fn restore_version(&mut self, snapshot: DocumentState) {
+        self.record_revision("Перед восстановлением");
+        self.push_undo(self.snapshot());
+        self.restore_snapshot(snapshot);
+        self.last_typing = None;
+        self.after_document_change("Восстановление версии");
+        self.requested_cursor = Some(0);
+        self.set_status(
+            "Версия восстановлена. Ctrl+Z — отменить. Файл изменится после сохранения.",
+            false,
+        );
     }
 
     fn check_updates(&mut self, ctx: &egui::Context) {
@@ -227,16 +485,16 @@ impl PoetApp {
             ui.label(format!("Текущая версия: {}", env!("CARGO_PKG_VERSION")));
             ui.label(&self.update_message);
             if self.update_busy { ui.spinner(); }
-            if ui.add_enabled(!self.update_busy, egui::Button::new("Проверить обновления")).clicked() { self.check_updates(ctx); }
             if let Some(manifest) = self.update_available.clone() {
-                ui.label("Перед установкой проверяются подпись и контрольная сумма. Текст останется открыт; новая версия запустится при следующем открытии приложения.");
                 if ui.add_enabled(!self.update_busy, egui::Button::new("Скачать и установить")).clicked() {
                     self.update_busy = true;
                     self.update_message = "Загружаем и проверяем подпись…".into();
                     let tx = self.tx.clone(); let ctx = ctx.clone();
                     std::thread::spawn(move || { let _ = tx.send(Background::UpdateInstalled(crate::updater::install(&manifest))); ctx.request_repaint(); });
                 }
+                ui.label("Перед установкой проверяются подпись и контрольная сумма. Текст останется открыт; новая версия запустится при следующем открытии приложения.");
             }
+            if ui.add_enabled(!self.update_busy, egui::Button::new("Проверить обновления")).clicked() { self.check_updates(ctx); }
             ui.hyperlink_to("Страница выпусков", format!("{}/releases", crate::updater::REPOSITORY));
         });
         self.show_updates = open;
@@ -421,15 +679,17 @@ impl PoetApp {
             self.rhyme_links.push(link);
         }
         self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+        self.record_revision("Опора рифмы");
     }
 
-    fn after_document_change(&mut self) {
+    fn after_document_change(&mut self, reason: &str) {
         self.rhyme_links.retain(|link| link.is_valid(&self.text));
         self.revision += 1;
         self.selection = None;
         self.anchor_line = None;
         self.invalidate_search();
         self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+        self.record_revision(reason);
     }
 
     fn snapshot(&self) -> DocumentState {
@@ -458,7 +718,7 @@ impl PoetApp {
         self.document_title = title;
         self.push_undo(previous);
         self.last_typing = None;
-        self.after_document_change();
+        self.after_document_change("Форматирование");
         self.requested_cursor = Some(0);
         self.set_status(
             "Markdown преобразован в обычный текст. Ctrl+Z — отменить.",
@@ -480,7 +740,7 @@ impl PoetApp {
             self.redo.push(current);
             self.restore_snapshot(previous);
             self.last_typing = None;
-            self.after_document_change();
+            self.after_document_change("Отмена");
             self.set_status("Изменение отменено", false);
         }
     }
@@ -491,7 +751,7 @@ impl PoetApp {
             self.undo.push(current);
             self.restore_snapshot(next);
             self.last_typing = None;
-            self.after_document_change();
+            self.after_document_change("Повтор");
             self.set_status("Изменение повторено", false);
         }
     }
@@ -525,7 +785,7 @@ impl PoetApp {
                 self.text = text;
                 self.push_undo(previous);
                 self.last_typing = None;
-                self.after_document_change();
+                self.after_document_change("Замена рифмы");
                 self.requested_cursor = Some(core::byte_to_char(&self.text, target_start));
                 self.select_word(target_start);
                 self.anchor = anchor;
@@ -547,6 +807,16 @@ impl PoetApp {
         let default_filename = formatter::suggested_filename(self.document_title.as_deref());
         let path = if save_as || self.file_path.is_none() {
             rfd::FileDialog::new()
+                .set_title("Сохранить текст")
+                .set_directory(
+                    self.file_path
+                        .as_deref()
+                        .and_then(std::path::Path::parent)
+                        .map(PathBuf::from)
+                        .or_else(|| self.last_document_folder.clone())
+                        .filter(|path| path.is_dir())
+                        .unwrap_or_else(storage::documents_directory),
+                )
                 .add_filter("Текст UTF-8", &["txt"])
                 .set_file_name(
                     self.file_path
@@ -562,9 +832,12 @@ impl PoetApp {
         let Some(path) = path else { return false };
         match storage::write_text(&path, &self.text) {
             Ok(()) => {
+                self.last_document_folder = path.parent().map(std::path::Path::to_owned);
                 self.file_path = Some(path);
                 self.saved_text = self.text.clone();
                 self.saved_title = self.document_title.clone();
+                self.record_revision("Сохранение файла");
+                self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
                 self.set_status("Текст сохранён", false);
                 true
             }
@@ -590,6 +863,17 @@ impl PoetApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             PendingAction::New => self.replace_document(String::new(), None),
+            PendingAction::CopyRevision(snapshot) => {
+                self.replace_document(snapshot.text.clone(), None);
+                self.restore_snapshot(snapshot);
+                self.saved_text.clear();
+                self.saved_title = None;
+                self.after_document_change("Копия версии");
+                self.set_status(
+                    "Версия открыта как новый текст. Исходная история сохранена.",
+                    false,
+                );
+            }
             PendingAction::Open(path) => match storage::read_text(&path) {
                 Ok(text) => self.replace_document(text, Some(path)),
                 Err(error) => self.set_status(error, true),
@@ -598,16 +882,20 @@ impl PoetApp {
     }
 
     fn replace_document(&mut self, text: String, path: Option<PathBuf>) {
+        self.document_id = history::new_document();
         self.rhyme_links.clear();
         self.document_title = None;
         self.saved_title = None;
         self.text = text;
         self.saved_text = self.text.clone();
+        if let Some(parent) = path.as_deref().and_then(std::path::Path::parent) {
+            self.last_document_folder = Some(parent.to_owned());
+        }
         self.file_path = path;
         self.undo.clear();
         self.redo.clear();
         self.last_typing = None;
-        self.after_document_change();
+        self.after_document_change("Открытие / новый документ");
         self.requested_cursor = Some(0);
         self.set_status("Выберите слово в конце строки для подбора рифмы.", false);
     }
@@ -645,7 +933,7 @@ impl PoetApp {
                                 .map(|name| name.to_string_lossy().into_owned())
                         })
                         .unwrap_or_else(|| "Новый текст".into());
-                    let title_width = (ui.available_width() - 550.0).clamp(100.0, 420.0);
+                    let title_width = (ui.available_width() - 640.0).clamp(50.0, 420.0);
                     ui.allocate_ui_with_layout(
                         egui::vec2(title_width, 30.0),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -673,6 +961,12 @@ impl PoetApp {
                         if ui.button("Словарь").clicked() {
                             self.show_dictionary = !self.show_dictionary;
                         }
+                        if ui.button("История").clicked() {
+                            self.show_history = !self.show_history;
+                            if let Some(history) = &self.history {
+                                history.catalogue();
+                            }
+                        }
                         if ui.button("Сохранить").on_hover_text("Ctrl+S").clicked() {
                             self.save(false);
                         }
@@ -685,6 +979,11 @@ impl PoetApp {
                     });
                 });
             });
+    }
+
+    fn navigate_to(&mut self, byte: usize) {
+        self.requested_cursor = Some(core::byte_to_char(&self.text, byte));
+        self.requested_scroll = self.requested_cursor;
     }
 
     fn outline(&mut self, ctx: &egui::Context) {
@@ -717,20 +1016,12 @@ impl PoetApp {
                         )
                         .clicked()
                     {
-                        self.requested_cursor = Some(core::byte_to_char(&self.text, start));
+                        self.navigate_to(start);
                     }
                 }
                 ui.add_space(22.0);
                 ui.separator();
                 ui.add_space(14.0);
-                ui.label(RichText::new("Текст остаётся вашим").size(13.0).color(INK));
-                ui.add_space(5.0);
-                ui.label(
-                    RichText::new("Рифмы ищутся локально. Вы выбираете каждую замену.")
-                        .size(12.0)
-                        .color(MUTED),
-                );
-                ui.add_space(20.0);
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(!self.undo.is_empty(), egui::Button::new("Отменить"))
@@ -767,7 +1058,7 @@ impl PoetApp {
                 ui.label(RichText::new(&selection.word).size(18.0).color(ACCENT).strong());
             });
             let line_syllables = core::parse_lines(&self.text).get(selection.line).map_or(0, |line| line.syllables);
-            ui.label(RichText::new(format!("Строка {} · {} слогов", selection.line + 1, line_syllables)).color(MUTED).size(12.0));
+            ui.label(RichText::new(format!("{} · {} слогов", core::line_label(&self.text, selection.line), line_syllables)).color(MUTED).size(12.0));
             let selected_line = selection.line;
             ui.add_space(15.0);
             let manual = self.rhyme_links.iter().any(|link| link.target == selected_line);
@@ -775,6 +1066,8 @@ impl PoetApp {
                 ui.label(if manual { "Опора выбрана вручную" } else { "Предложенная опора" });
                 if manual && ui.small_button("Авто").on_hover_text("Забыть ручной выбор для этой строки").clicked() {
                     self.rhyme_links.retain(|link| link.target != selected_line);
+                    self.record_revision("Автоматическая опора");
+                    self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
                     let at = self.selection.as_ref().unwrap().span.start;
                     self.select_word(at);
                 }
@@ -806,13 +1099,13 @@ impl PoetApp {
             let mut anchor_choice = None;
             egui::ComboBox::from_id_salt("anchor_line")
                 .width(ui.available_width() - 8.0)
-                .selected_text(self.anchor_line.map(|line| format!("Из строки {}", line + 1)).unwrap_or_else(|| "Выбрать строку-опору".into()))
+                .selected_text(self.anchor_line.map(|line| format!("Из {}", core::line_label(&self.text, line))).unwrap_or_else(|| "Выбрать строку-опору".into()))
                 .show_ui(ui, |ui| {
                     for line in core::parse_lines(&self.text) {
                         if line.index == selected_line { continue }
                         if let Some(span) = line.last_word {
                             let word = self.text[span].to_owned();
-                            if ui.selectable_label(self.anchor_line == Some(line.index), format!("{} · {}", line.index + 1, word)).clicked() {
+                            if ui.selectable_label(self.anchor_line == Some(line.index), format!("{} · {}", core::line_label(&self.text, line.index), word)).clicked() {
                                 anchor_choice = Some((line.index, word));
                             }
                         }
@@ -994,10 +1287,12 @@ impl PoetApp {
                 };
                 let mut clicked_position = None;
                 let mut changed = false;
-                egui::ScrollArea::vertical()
+                let scroll_output = egui::ScrollArea::vertical()
                     .id_salt("poem_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                        ui.add_space(26.0);
                         let output = egui::TextEdit::multiline(&mut self.text)
                             .id(editor_id)
                             .font(FontId::proportional(21.0))
@@ -1007,6 +1302,24 @@ impl PoetApp {
                             .hint_text("[Куплет 1]\nНачните писать или вставьте заготовку…")
                             .layouter(&mut layouter)
                             .show(ui);
+                        let numbers = core::verse_numbers(&self.text);
+                        let mut line = 0;
+                        let mut first_row = true;
+                        for row in &output.galley.rows {
+                            if first_row {
+                                if let Some(number) = numbers.get(line).copied().flatten() {
+                                    let pos = egui::pos2(output.galley_pos.x - 16.0, output.galley_pos.y + row.rect.center().y);
+                                    ui.painter().text(pos, egui::Align2::RIGHT_CENTER, number.to_string(), FontId::proportional(12.0), MUTED);
+                                }
+                            }
+                            first_row = row.ends_with_newline;
+                            if row.ends_with_newline { line += 1; }
+                        }
+                        if let Some(cursor) = self.requested_scroll.take() {
+                            let rect = output.galley.pos_from_ccursor(egui::text::CCursor::new(cursor))
+                                .translate(output.galley_pos.to_vec2());
+                            ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                        }
                         changed = output.response.changed();
                         if output.response.clicked() && !output.response.double_clicked() {
                             if let Some(pos) = output.response.interact_pointer_pos() {
@@ -1014,7 +1327,9 @@ impl PoetApp {
                                 clicked_position = Some(cursor.ccursor.index);
                             }
                         }
+                        });
                     });
+                self.editor_scroll = scroll_output.state.offset.y;
                 if changed || self.document_title != previous.title {
                     let now = Instant::now();
                     let coalesce = !pasted && self
@@ -1026,7 +1341,7 @@ impl PoetApp {
                         self.redo.clear();
                     }
                     self.last_typing = if pasted { None } else { Some(now) };
-                    self.after_document_change();
+                    self.after_document_change("Набор / вставка");
                 }
                 if let Some(character) = clicked_position {
                     self.last_typing = None;
@@ -1060,7 +1375,7 @@ impl PoetApp {
             } else if let Some(error) = &self.dictionary_error {
                 ui.colored_label(Color32::LIGHT_RED, error);
             } else if let Some(lexicon) = &self.lexicon {
-                ui.colored_label(Color32::from_rgb(127, 201, 173), format!("Подключено: {} записей", format_count(lexicon.entries.len())));
+                ui.colored_label(Color32::from_rgb(127, 201, 173), format!("Подключено: {} словоформ", format_count(lexicon.entries.len())));
                 ui.label(RichText::new(&lexicon.source).small().color(MUTED));
             }
             ui.add_space(12.0);
@@ -1157,6 +1472,21 @@ impl PoetApp {
                 finish(ctx, Err("багажа missing from candidates".into()));
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
+            if std::env::args().any(|arg| arg == "--smoke-navigation") {
+                let text = format!("[Начало]\n{}\n[Проверка перехода]\nДлинная строка {}\nВторая строка\nТретья строка\nЧетвёртая строка\n\n{}", "Строка до секции\n".repeat(80), "со словами ".repeat(25), "Строка после секции\n".repeat(80));
+                self.replace_document(text, None);
+                self.navigate_to(self.text.find("[Проверка перехода]").unwrap());
+                self.smoke_started = Instant::now();
+                self.smoke_stage = 15;
+                return;
+            }
+            if std::env::args().any(|arg| arg == "--smoke-history") {
+                if let Some(history) = &self.history {
+                    history.catalogue();
+                }
+                self.smoke_stage = 12;
+                return;
+            }
             if std::env::args().any(|arg| arg == "--smoke-formatter") {
                 self.replace_document(FORMAT_DRAFT.into(), None);
                 self.format_document();
@@ -1209,6 +1539,81 @@ impl PoetApp {
             self.set_status("Проверено: словарь, поиск, замена, отмена и повтор.", false);
             self.smoke_started = Instant::now();
             self.smoke_stage = 2;
+        } else if self.smoke_stage == 15
+            && self.smoke_started.elapsed() > Duration::from_millis(700)
+        {
+            if self.editor_scroll < 1500.0 {
+                finish(
+                    ctx,
+                    Err(format!(
+                        "section navigation did not scroll: {}",
+                        self.editor_scroll
+                    )),
+                );
+                return;
+            }
+            self.navigate_to(0);
+            self.smoke_started = Instant::now();
+            self.smoke_stage = 16;
+        } else if self.smoke_stage == 16
+            && self.smoke_started.elapsed() > Duration::from_millis(700)
+        {
+            if self.editor_scroll > 1.0 {
+                finish(
+                    ctx,
+                    Err(format!("navigation to top failed: {}", self.editor_scroll)),
+                );
+                return;
+            }
+            self.navigate_to(self.text.find("[Проверка перехода]").unwrap());
+            self.smoke_started = Instant::now();
+            self.smoke_stage = 17;
+        } else if self.smoke_stage == 17
+            && self.smoke_started.elapsed() > Duration::from_millis(700)
+        {
+            if self.editor_scroll < 1500.0 {
+                finish(ctx, Err("second section navigation failed".into()));
+                return;
+            }
+            self.set_status(
+                "Проверено: переход к секции, возврат наверх, номера строк и переносы.",
+                false,
+            );
+            self.smoke_started = Instant::now();
+            self.smoke_stage = 2;
+        } else if self.smoke_stage == 12 && !self.history_entries.is_empty() {
+            let Some(entry) = self
+                .history_entries
+                .iter()
+                .find(|entry| entry.reason == "Замена рифмы")
+            else {
+                finish(ctx, Err("rhyme replacement missing from history".into()));
+                return;
+            };
+            self.history_selected = Some(entry.id.clone());
+            self.history.as_ref().unwrap().preview(&entry.id);
+            self.smoke_stage = 13;
+        } else if self.smoke_stage == 13 && self.history_preview.is_some() {
+            let before = self.text.clone();
+            self.restore_version(self.history_preview.clone().unwrap());
+            if !self.text.contains("багажа") {
+                finish(ctx, Err("revision restore mismatch".into()));
+                return;
+            }
+            self.undo();
+            if self.text != before {
+                finish(ctx, Err("revision restore undo mismatch".into()));
+                return;
+            }
+            self.redo();
+            if !self.text.contains("багажа") {
+                finish(ctx, Err("revision restore redo mismatch".into()));
+                return;
+            }
+            self.history.as_ref().unwrap().catalogue();
+            self.show_history = true;
+            self.smoke_started = Instant::now();
+            self.smoke_stage = 2;
         } else if self.smoke_stage == 7 {
             if self.text != FORMATTED_DRAFT
                 || self.document_title.as_deref() != Some("«Тракторист Семён Петров»")
@@ -1234,6 +1639,7 @@ impl PoetApp {
                 document_title: self.document_title.clone(),
                 dictionary_folder: self.dictionary_folder.clone(),
                 rhyme_links: self.rhyme_links.clone(),
+                last_document_folder: self.last_document_folder.clone(),
             };
             let restored: storage::Session =
                 serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
@@ -1327,6 +1733,7 @@ impl PoetApp {
 impl eframe::App for PoetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_background();
+        self.receive_history();
         if ctx.input(|input| input.viewport().close_requested())
             && !self.allow_close
             && !self.smoke_test
@@ -1371,6 +1778,7 @@ impl eframe::App for PoetApp {
                 document_title: self.document_title.clone(),
                 dictionary_folder: self.dictionary_folder.clone(),
                 rhyme_links: self.rhyme_links.clone(),
+                last_document_folder: self.last_document_folder.clone(),
             }) {
                 self.set_status(
                     format!("Не удалось сохранить восстановление: {error}"),
@@ -1393,12 +1801,31 @@ impl eframe::App for PoetApp {
                     ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(10.0);
+                        let history_status = if self.history_error.is_some() {
+                            "Ошибка истории"
+                        } else if self.history.as_ref().is_some_and(|h| h.pending > 0) {
+                            "Запись истории…"
+                        } else {
+                            "История сохранена"
+                        };
+                        ui.label(RichText::new(history_status).size(11.0).color(
+                            if self.history_error.is_some() {
+                                Color32::LIGHT_RED
+                            } else {
+                                MUTED
+                            },
+                        ))
+                        .on_hover_text(
+                            self.history_error
+                                .as_deref()
+                                .unwrap_or("Локальные ревизии · кнопка «История»"),
+                        );
                         if self.dictionary_loading {
                             ui.spinner();
                         } else if let Some(lexicon) = &self.lexicon {
                             ui.label(
                                 RichText::new(format!(
-                                    "Rhymes · {} записей",
+                                    "Rhymes · {} словоформ",
                                     format_count(lexicon.entries.len())
                                 ))
                                 .size(11.0)
@@ -1413,6 +1840,7 @@ impl eframe::App for PoetApp {
         self.editor(ctx);
         self.dictionary_window(ctx);
         self.updates_window(ctx);
+        self.history_window(ctx);
         self.pending_window(ctx);
         if self.smoke_test {
             self.smoke_update(ctx);
@@ -1431,6 +1859,9 @@ impl eframe::App for PoetApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(history) = &mut self.history {
+            history.shutdown();
+        }
         if self.smoke_test {
             return;
         }
@@ -1439,6 +1870,7 @@ impl eframe::App for PoetApp {
             document_title: self.document_title.clone(),
             dictionary_folder: self.dictionary_folder.clone(),
             rhyme_links: self.rhyme_links.clone(),
+            last_document_folder: self.last_document_folder.clone(),
         });
     }
 }
@@ -1519,6 +1951,26 @@ fn layout_poem(text: &str, selected: Option<&Range<usize>>) -> egui::text::Layou
     }
     job.append(&text[at..], 0.0, normal);
     job
+}
+
+// Gregorian calendar conversion; dates in history are explicitly displayed in UTC.
+fn revision_date(seconds: u64) -> String {
+    let days = (seconds / 86400) as i64 + 719468;
+    let era = days / 146097;
+    let doe = days - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{day:02}.{month:02}.{year} {:02}:{:02}:{:02} UTC",
+        seconds / 3600 % 24,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 fn format_count(value: usize) -> String {

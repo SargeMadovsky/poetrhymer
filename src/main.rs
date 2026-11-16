@@ -2,6 +2,7 @@
 
 mod core;
 mod formatter;
+mod history;
 mod lexicon;
 mod storage;
 mod ui;

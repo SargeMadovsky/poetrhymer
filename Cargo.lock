@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "poetrhymer"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ed25519-dalek",
  "eframe",
@@ -2487,6 +2487,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

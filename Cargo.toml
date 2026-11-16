@@ -1,6 +1,6 @@
 [package]
 name = "poetrhymer"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 default-run = "poetrhymer"
 description = "Локальный редактор стихов и песен"
@@ -21,6 +21,9 @@ hex = "0.4"
 semver = "1"
 self-replace = "1.5"
 tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation"] }
 
 [build-dependencies]
 winresource = "0.1.34"
