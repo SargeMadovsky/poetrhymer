@@ -6,7 +6,7 @@ pub struct LineInfo {
     pub index: usize,
     pub span: Range<usize>,
     pub last_word: Option<Range<usize>>,
-    /// Some only for standalone [section] headings.
+    /// Some only for standalone square-bracket or Markdown headings.
     pub section: Option<String>,
     pub syllables: usize,
 }
@@ -23,17 +23,28 @@ fn is_word_char(c: char) -> bool {
     c.is_alphabetic() || c == '\u{301}' || c == '-'
 }
 
+fn heading_title(line: &str) -> Option<String> {
+    let line = line.trim();
+    let title = if let Some(title) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        (!title.contains(['[', ']'])).then_some(title)?
+    } else if let Some(title) = line.strip_prefix("**").and_then(|s| s.strip_suffix("**")) {
+        (!title.contains("**")).then_some(title)?
+    } else {
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if !(1..=6).contains(&hashes) || !line[hashes..].starts_with(char::is_whitespace) {
+            return None;
+        }
+        line[hashes..].trim().trim_end_matches('#').trim()
+    };
+    (!title.trim().is_empty()).then(|| title.trim().to_owned())
+}
+
 pub fn parse_lines(text: &str) -> Vec<LineInfo> {
     let mut offset = 0;
     text.split('\n')
         .enumerate()
         .map(|(index, line)| {
-            let trimmed = line.trim();
-            let section = trimmed
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .filter(|s| !s.trim().is_empty() && !s.contains(['[', ']']))
-                .map(|s| s.trim().to_owned());
+            let section = heading_title(line);
             let mut end = None;
             let mut start = 0;
             if section.is_none() {
@@ -65,6 +76,95 @@ pub fn parse_lines(text: &str) -> Vec<LineInfo> {
             result
         })
         .collect()
+}
+
+/// Suggest a partner only within the current stanza. This lightweight suffix
+/// heuristic is a visible suggestion, not an inferred mandatory rhyme scheme.
+pub fn suggest_anchor(text: &str, selected: usize) -> Option<usize> {
+    let lines = parse_lines(text);
+    let line = lines.get(selected)?;
+    let target = text.get(line.last_word.clone()?)?;
+    let start = (0..selected)
+        .rev()
+        .find(|i| lines[*i].last_word.is_none())
+        .map_or(0, |i| i + 1);
+    let end = (selected + 1..lines.len())
+        .find(|i| lines[*i].last_word.is_none())
+        .unwrap_or(lines.len());
+    let ending = |word: &str| {
+        normalized(word)
+            .chars()
+            .filter(|c| *c != 'ь' && *c != 'ъ')
+            .map(sound)
+            .rev()
+            .collect::<Vec<_>>()
+    };
+    let target_end = ending(target);
+    (start..end)
+        .filter(|i| *i != selected)
+        .filter_map(|i| {
+            let word = &text[lines[i].last_word.clone()?];
+            let suffix = target_end
+                .iter()
+                .zip(ending(word))
+                .take_while(|(a, b)| **a == *b)
+                .count();
+            (suffix >= 2).then_some((
+                suffix,
+                std::cmp::Reverse(i.abs_diff(selected)),
+                std::cmp::Reverse(i),
+                i,
+            ))
+        })
+        .max()
+        .map(|(_, _, _, index)| index)
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RhymeLink {
+    pub target: usize,
+    pub anchor: Option<usize>,
+    pub word: String,
+    target_text: String,
+    anchor_text: Option<String>,
+}
+
+impl RhymeLink {
+    pub fn new(text: &str, target: usize, anchor: Option<usize>, word: String) -> Option<Self> {
+        let lines = parse_lines(text);
+        let target_line = lines.get(target)?;
+        target_line.last_word.as_ref()?;
+        let anchor_text = match anchor {
+            Some(index) => {
+                let line = lines.get(index)?;
+                line.last_word.as_ref()?;
+                Some(text[line.span.clone()].to_owned())
+            }
+            None => None,
+        };
+        Some(Self {
+            target,
+            anchor,
+            word,
+            target_text: text[target_line.span.clone()].to_owned(),
+            anchor_text,
+        })
+    }
+
+    pub fn is_valid(&self, text: &str) -> bool {
+        let lines = parse_lines(text);
+        let matches = |index: usize, expected: &str| {
+            lines.get(index).is_some_and(|line| {
+                line.last_word.is_some() && &text[line.span.clone()] == expected
+            })
+        };
+        matches(self.target, &self.target_text)
+            && match (self.anchor, &self.anchor_text) {
+                (Some(index), Some(expected)) => index != self.target && matches(index, expected),
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 pub fn char_to_byte(text: &str, index: usize) -> usize {
@@ -267,6 +367,66 @@ pub fn search_rhymes(
 mod tests {
     use super::*;
     use crate::lexicon::Entry;
+
+    #[test]
+    fn markdown_headings_are_not_verse_lines() {
+        let text = "# Название\n\n**Куплет 1**\nНад полями\n## Припев\n[Бридж]\n#метка внутри строки\nСлово **внутри** строки";
+        let lines = parse_lines(text);
+        for index in [0, 2, 4, 5] {
+            assert!(lines[index].section.is_some());
+            assert!(lines[index].last_word.is_none());
+            assert_eq!(lines[index].syllables, 0);
+        }
+        assert_eq!(lines[2].section.as_deref(), Some("Куплет 1"));
+        assert!(lines[6].section.is_none());
+        assert!(lines[7].section.is_none());
+    }
+
+    #[test]
+    fn anchor_stays_in_stanza_and_finds_following_partner() {
+        let text = "# Тракторист Семён Петров\n\n**Куплет 1**\nНад полями\nПоднимается туман\nВместе с нами\nНа работу ветеран\n\n[Припев]\nНовая строка";
+        assert_eq!(suggest_anchor(text, 3), Some(5));
+        assert_eq!(suggest_anchor(text, 5), Some(3));
+        assert_eq!(suggest_anchor(text, 4), Some(6));
+        assert_eq!(suggest_anchor(text, 9), None);
+        assert_eq!(
+            suggest_anchor("[Куплет]\nЗаготовил фуража\n\n[Припев]\nНе спеша", 1),
+            None
+        );
+        assert_eq!(
+            suggest_anchor("Петрович\nНе спеша\nРаботал\nФуража", 3),
+            Some(1)
+        );
+        assert_eq!(
+            suggest_anchor("Петрович\nНе спеша\nРаботал\nФуража", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn suggestions_allow_adjacent_alternating_and_enclosed_pairs() {
+        for (text, expected) in [
+            ("кот\nплот\nлуна\nструна", [1, 0, 3, 2]),
+            ("кот\nлуна\nплот\nструна", [2, 3, 0, 1]),
+            ("кот\nлуна\nструна\nплот", [3, 2, 1, 0]),
+        ] {
+            for (index, anchor) in expected.into_iter().enumerate() {
+                assert_eq!(suggest_anchor(text, index), Some(anchor));
+            }
+        }
+    }
+
+    #[test]
+    fn manual_link_roundtrips_and_rejects_stale_lines() {
+        let text = "Над полями\nВместе с нами";
+        let link = RhymeLink::new(text, 0, Some(1), "нами".into()).unwrap();
+        let json = serde_json::to_string(&link).unwrap();
+        let restored: RhymeLink = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_valid(text));
+        assert!(!restored.is_valid("Над полями\nВместе с вами"));
+        assert!(!restored.is_valid("Название\nНад полями\nВместе с нами"));
+        assert!(restored.is_valid("Над полями\nВместе с нами\nНовая строка"));
+    }
 
     #[test]
     fn section_and_word_spans_preserve_unicode_and_punctuation() {

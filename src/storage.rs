@@ -8,6 +8,8 @@ use std::{
 pub struct Session {
     pub text: String,
     pub dictionary_folder: String,
+    #[serde(default)]
+    pub rhyme_links: Vec<crate::core::RhymeLink>,
 }
 
 pub fn default_dictionary_folder() -> PathBuf {
@@ -101,6 +103,12 @@ pub fn write_text(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn older_recovery_files_load_without_rhyme_links() {
+        let session: Session =
+            serde_json::from_str(r#"{"text":"строка","dictionary_folder":"Rhymes 3"}"#).unwrap();
+        assert!(session.rhyme_links.is_empty());
+    }
     #[test]
     fn save_twice_preserves_previous_file_and_utf8() {
         let dir = std::env::temp_dir().join(format!("poetrhymer-test-{}", std::process::id()));

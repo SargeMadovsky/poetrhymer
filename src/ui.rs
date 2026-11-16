@@ -46,6 +46,7 @@ pub struct PoetApp {
     selection: Option<Selection>,
     anchor: String,
     anchor_line: Option<usize>,
+    rhyme_links: Vec<core::RhymeLink>,
     match_syllables: bool,
     closer_only: bool,
     syllable_count: usize,
@@ -94,6 +95,7 @@ impl PoetApp {
         let mut session = recovery.unwrap_or_else(|| storage::Session {
             text: SAMPLE.to_owned(),
             dictionary_folder: default_folder.to_string_lossy().into_owned(),
+            rhyme_links: Vec::new(),
         });
         let saved_folder = PathBuf::from(&session.dictionary_folder);
         let legacy_default = storage::app_directory().join("Rhymes 3");
@@ -120,6 +122,7 @@ impl PoetApp {
             selection: None,
             anchor: String::new(),
             anchor_line: None,
+            rhyme_links: session.rhyme_links,
             match_syllables: true,
             closer_only: false,
             syllable_count: 3,
@@ -157,6 +160,7 @@ impl PoetApp {
             smoke_stage: 0,
             smoke_started: Instant::now(),
         };
+        app.rhyme_links.retain(|link| link.is_valid(&app.text));
         if !recovered {
             if let Some(at) = app.text.find("фуража") {
                 app.select_word(at);
@@ -368,18 +372,16 @@ impl PoetApp {
             line: line.index,
             revision: self.revision,
         });
-        // A visible, editable starting choice: the previous-but-one verse line,
-        // or the immediately previous line when only one is available.
-        let preceding: Vec<_> = lines
+        if let Some(link) = self
+            .rhyme_links
             .iter()
-            .filter(|other| {
-                other.index < line.index && other.last_word.is_some() && other.section.is_none()
-            })
-            .collect();
-        let preferred = preceding.iter().rev().nth(1).or_else(|| preceding.last());
-        if let Some(other) = preferred {
-            self.anchor = self.text[other.last_word.clone().unwrap()].to_owned();
-            self.anchor_line = Some(other.index);
+            .find(|link| link.target == line.index && link.is_valid(&self.text))
+        {
+            self.anchor = link.word.clone();
+            self.anchor_line = link.anchor;
+        } else if let Some(index) = core::suggest_anchor(&self.text, line.index) {
+            self.anchor = self.text[lines[index].last_word.clone().unwrap()].to_owned();
+            self.anchor_line = Some(index);
         } else {
             self.anchor.clear();
             self.anchor_line = None;
@@ -387,7 +389,22 @@ impl PoetApp {
         self.schedule_search();
     }
 
+    fn remember_anchor(&mut self) {
+        let Some(selection) = &self.selection else {
+            return;
+        };
+        let target = selection.line;
+        self.rhyme_links.retain(|link| link.target != target);
+        if let Some(link) =
+            core::RhymeLink::new(&self.text, target, self.anchor_line, self.anchor.clone())
+        {
+            self.rhyme_links.push(link);
+        }
+        self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
+    }
+
     fn after_document_change(&mut self) {
+        self.rhyme_links.retain(|link| link.is_valid(&self.text));
         self.revision += 1;
         self.selection = None;
         self.anchor_line = None;
@@ -436,6 +453,10 @@ impl PoetApp {
             return;
         }
         let target_start = selection.span.start;
+        let was_manual = self
+            .rhyme_links
+            .iter()
+            .any(|link| link.target == selection.line);
         let old_word = selection.word.clone();
         let new_word = candidate.word.clone();
         let anchor = self.anchor.clone();
@@ -450,6 +471,9 @@ impl PoetApp {
                 self.select_word(target_start);
                 self.anchor = anchor;
                 self.anchor_line = anchor_line;
+                if was_manual {
+                    self.remember_anchor();
+                }
                 self.schedule_search();
                 self.set_status(
                     format!("«{old_word}» → «{new_word}». Ctrl+Z — отменить."),
@@ -513,6 +537,7 @@ impl PoetApp {
     }
 
     fn replace_document(&mut self, text: String, path: Option<PathBuf>) {
+        self.rhyme_links.clear();
         self.text = text;
         self.saved_text = self.text.clone();
         self.file_path = path;
@@ -596,9 +621,11 @@ impl PoetApp {
                     .collect();
                 if sections.is_empty() {
                     ui.label(
-                        RichText::new("Добавьте [Куплет] или [Припев] отдельной строкой.")
-                            .color(MUTED)
-                            .size(13.0),
+                        RichText::new(
+                            "Заголовки: [Куплет], **Припев** или # Название отдельной строкой.",
+                        )
+                        .color(MUTED)
+                        .size(13.0),
                     );
                 }
                 for (title, start) in sections {
@@ -662,9 +689,19 @@ impl PoetApp {
             ui.label(RichText::new(format!("Строка {} · {} слогов", selection.line + 1, line_syllables)).color(MUTED).size(12.0));
             let selected_line = selection.line;
             ui.add_space(15.0);
+            let manual = self.rhyme_links.iter().any(|link| link.target == selected_line);
+            ui.horizontal(|ui| {
+                ui.label(if manual { "Опора выбрана вручную" } else { "Предложенная опора" });
+                if manual && ui.small_button("Авто").on_hover_text("Забыть ручной выбор для этой строки").clicked() {
+                    self.rhyme_links.retain(|link| link.target != selected_line);
+                    let at = self.selection.as_ref().unwrap().span.start;
+                    self.select_word(at);
+                }
+            });
             ui.label("Рифма к слову");
             if ui.add(egui::TextEdit::singleline(&mut self.anchor).desired_width(f32::INFINITY).hint_text("Например, спеша́")).changed() {
                 self.anchor_line = None;
+                self.remember_anchor();
                 self.schedule_search();
             }
             let unaccented: String = self.anchor.chars().filter(|c| *c != '\u{301}').collect();
@@ -682,6 +719,7 @@ impl PoetApp {
             }
             if let Some(stress) = stress_choice {
                 self.anchor = core::with_stress(&unaccented, stress);
+                self.remember_anchor();
                 self.schedule_search();
             }
             let mut anchor_choice = None;
@@ -702,7 +740,13 @@ impl PoetApp {
             if let Some((line, word)) = anchor_choice {
                 self.anchor_line = Some(line);
                 self.anchor = word;
+                self.remember_anchor();
                 self.schedule_search();
+            }
+            if let Some(index) = self.anchor_line {
+                if let Some(line) = core::parse_lines(&self.text).get(index) {
+                    ui.label(RichText::new(self.text[line.span.clone()].trim()).small().color(MUTED));
+                }
             }
             ui.add_space(12.0);
             let mut filter_changed = false;
@@ -978,12 +1022,45 @@ impl PoetApp {
                 finish(ctx, Err("багажа missing from candidates".into()));
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
+            if std::env::args().any(|arg| arg == "--smoke-stanzas") {
+                self.replace_document("# Тракторист Семён Петров\n\n**Куплет 1**\nНа рассвете над полями\nПоднимается туман,\nИ выходит вместе с нами\nНа работу ветеран.\n\n[Припев]\nЗдесь другая строка\n".into(), None);
+                let target = self.text.find("полями").unwrap();
+                self.select_word(target);
+                if self.anchor != "нами" {
+                    finish(ctx, Err("wrong stanza partner".into()));
+                    return;
+                }
+                self.anchor = "ветеран".into();
+                self.anchor_line = Some(6);
+                self.remember_anchor();
+                self.select_word(self.text.find("туман").unwrap());
+                self.select_word(target);
+                if self.anchor != "ветеран" {
+                    finish(ctx, Err("manual partner lost".into()));
+                    return;
+                }
+                self.rhyme_links.clear();
+                self.select_word(target);
+                if self.anchor != "нами" {
+                    finish(ctx, Err("auto partner not restored".into()));
+                    return;
+                }
+                self.smoke_stage = 5;
+                return;
+            }
             self.chosen = self.candidates.iter().position(|c| c.word == "багажа");
             if std::env::args().any(|arg| arg == "--smoke-updates") {
                 self.show_updates = true;
                 self.update_message = "Установлена актуальная версия".into();
             }
             self.set_status("Проверено: словарь, поиск, замена, отмена и повтор.", false);
+            self.smoke_started = Instant::now();
+            self.smoke_stage = 2;
+        } else if self.smoke_stage == 5 && !self.search_loading && self.search_due.is_none() {
+            self.set_status(
+                "Проверено: Markdown, строфы, опора «нами», ручной выбор и возврат в авто.",
+                false,
+            );
             self.smoke_started = Instant::now();
             self.smoke_stage = 2;
         } else if self.smoke_stage == 2 && self.smoke_started.elapsed() > Duration::from_millis(400)
@@ -1067,6 +1144,7 @@ impl eframe::App for PoetApp {
             if let Err(error) = storage::save_recovery(&storage::Session {
                 text: self.text.clone(),
                 dictionary_folder: self.dictionary_folder.clone(),
+                rhyme_links: self.rhyme_links.clone(),
             }) {
                 self.set_status(
                     format!("Не удалось сохранить восстановление: {error}"),
@@ -1129,6 +1207,7 @@ impl eframe::App for PoetApp {
         let _ = storage::save_recovery(&storage::Session {
             text: self.text.clone(),
             dictionary_folder: self.dictionary_folder.clone(),
+            rhyme_links: self.rhyme_links.clone(),
         });
     }
 }
