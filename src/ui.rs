@@ -1510,16 +1510,23 @@ impl PoetApp {
                 self.schedule_search();
             }
             let unaccented: String = self.anchor.chars().filter(|c| *c != '\u{301}').collect();
-            let vowels: Vec<char> = unaccented.chars().filter(|c| "аеёиоуыэюяАЕЁИОУЫЭЮЯ".contains(*c)).collect();
             let mut stress_choice = None;
             if stress::needs_mark(&unaccented) {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Ударение:").small().color(MUTED));
-                    for index in 0..vowels.len() {
-                        if stress_option(ui, &unaccented, index, false, false, true).clicked() {
-                            stress_choice = Some(index);
+                let known = stress::dictionary_choices(&unaccented, self.lexicon.as_deref());
+                if !known.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Ударение из словаря:").small().color(MUTED));
+                        for index in known {
+                            if stress_option(ui, &unaccented, index, false, true, true).clicked() {
+                                stress_choice = Some(index);
+                            }
                         }
-                    }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Вручную: двойной клик по гласной").small().color(MUTED));
+                    let (_, choice) = manual_stress_word(ui, &unaccented, None);
+                    if choice.is_some() { stress_choice = choice; }
                 });
             }
             if let Some(stress) = stress_choice {
@@ -1829,6 +1836,35 @@ impl PoetApp {
         }
     }
 
+    fn word_stress_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        token: &stress::Token,
+        vowels: &[usize],
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            for (index, &vowel) in vowels.iter().enumerate() {
+                let response = stress_option(
+                    ui,
+                    &token.word,
+                    vowel,
+                    token.selected == Some(vowel),
+                    token.choices.contains(&vowel),
+                    false,
+                );
+                if self.stress_focus && index == 0 {
+                    response.request_focus();
+                    self.stress_focus = false;
+                }
+                if response.clicked() {
+                    self.set_word_stress(token.span.start, Some(vowel));
+                    self.close_stress_popup(ctx);
+                }
+            }
+        });
+    }
+
     fn close_stress_popup(&mut self, ctx: &egui::Context) {
         self.stress_selected = None;
         self.stress_focus = false;
@@ -1870,7 +1906,11 @@ impl PoetApp {
                     ui.label("Обновляем разметку…");
                     return;
                 };
-                ui.label(RichText::new(&token.word).size(20.0).strong());
+                let (_, manual_choice) = manual_stress_word(ui, &token.word, token.selected);
+                if let Some(vowel) = manual_choice {
+                    self.set_word_stress(start, Some(vowel));
+                    self.close_stress_popup(ctx);
+                }
                 ui.label(match token.source {
                     stress::Source::Manual => "Выбрано вручную",
                     stress::Source::Dictionary => "Ударение из словаря",
@@ -1887,26 +1927,15 @@ impl PoetApp {
                             .color(MUTED),
                     );
                 }
-                ui.horizontal_wrapped(|ui| {
-                    for vowel in 0..token.vowels.len() {
-                        let response = stress_option(
-                            ui,
-                            &token.word,
-                            vowel,
-                            token.selected == Some(vowel),
-                            token.choices.contains(&vowel),
-                            false,
-                        );
-                        if self.stress_focus && vowel == 0 {
-                            response.request_focus();
-                            self.stress_focus = false;
-                        }
-                        if response.clicked() {
-                            self.set_word_stress(start, Some(vowel));
-                            self.close_stress_popup(ctx);
-                        }
+                if token.choices.is_empty() {
+                    ui.label("Словарных вариантов нет. Укажите ударение двойным кликом по гласной в слове сверху.");
+                } else {
+                    ui.label("Из словаря Rhymes:");
+                    self.word_stress_options(ui, ctx, &token, &token.choices);
+                    if token.selected.is_some_and(|vowel| !token.choices.contains(&vowel)) {
+                        ui.label("Текущий ручной выбор отсутствует в словаре.");
                     }
-                });
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Без ударения").clicked() {
                         self.set_word_stress(start, None);
@@ -1923,11 +1952,7 @@ impl PoetApp {
                         self.close_stress_popup(ctx);
                     }
                 });
-                ui.label(
-                    RichText::new("Подчёркнуты словарные варианты · Esc — закрыть")
-                        .small()
-                        .color(MUTED),
-                );
+                ui.label(RichText::new("Двойной клик по гласной сверху — вручную · Esc — закрыть").small().color(MUTED));
             });
         if !open {
             self.stress_selected = None;
@@ -2731,6 +2756,32 @@ impl PoetApp {
                 self.smoke_stage = 21;
                 return;
             }
+            if std::env::args().any(|arg| arg == "--smoke-stress-dictionary") {
+                self.replace_document("[Куплет 1]\nИ выходит вместе с нами\n".into(), None);
+                self.stress_mode = true;
+                let start = self.text.find("выходит").unwrap();
+                let analysis = stress::analyze(&self.text, &[], self.lexicon.as_deref());
+                if analysis
+                    .tokens
+                    .iter()
+                    .find(|token| token.span.start == start)
+                    .unwrap()
+                    .choices
+                    != vec![0, 1]
+                {
+                    finish(
+                        ctx,
+                        Err("unexpected dictionary variants for выходит".into()),
+                    );
+                    return;
+                }
+                self.stress_analysis = Some(Arc::new(analysis));
+                self.stress_selected = Some(start);
+                self.stress_popup_pos = egui::pos2(530.0, 390.0);
+                self.smoke_started = Instant::now();
+                self.smoke_stage = 2;
+                return;
+            }
             if std::env::args().any(|arg| arg == "--smoke-stress") {
                 self.replace_document("[Куплет 1]\nСтарый замок на горе,\nЁжик прячется в траве.\nФыжобряк тихонько дышит,\nОблачённый ветром слышит.\n".into(), None);
                 self.stress_mode = true;
@@ -3458,6 +3509,55 @@ fn paint_meter_deviations(
     }
 }
 
+// One readable word with per-vowel hit testing; a single click never changes it.
+fn manual_stress_word(
+    ui: &mut egui::Ui,
+    word: &str,
+    selected: Option<usize>,
+) -> (egui::Response, Option<usize>) {
+    let clean = stress::clean(word);
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(clean, FontId::proportional(20.0), INK));
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::click());
+    ui.painter().galley(rect.min, galley.clone(), INK);
+    let pointer = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .filter(|_| response.hovered());
+    let mut vowel = 0;
+    let mut choice = None;
+    for row in &galley.rows {
+        for glyph in &row.glyphs {
+            if !stress::is_vowel(glyph.chr) {
+                continue;
+            }
+            let bounds = glyph.logical_rect().translate(rect.min.to_vec2());
+            if selected == Some(vowel) {
+                let x = bounds.center().x;
+                let y = rect.top() + row.rect.top();
+                ui.painter().line_segment(
+                    [egui::pos2(x - 1.0, y + 5.0), egui::pos2(x + 2.0, y + 1.0)],
+                    Stroke::new(1.5_f32, ACCENT),
+                );
+            }
+            if pointer.is_some_and(|point| bounds.contains(point)) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                ui.painter().line_segment(
+                    [bounds.left_bottom(), bounds.right_bottom()],
+                    Stroke::new(1.0_f32, ACCENT),
+                );
+                response
+                    .clone()
+                    .on_hover_text("Двойной клик — поставить ударение на эту гласную вручную");
+                if response.double_clicked() {
+                    choice = Some(vowel);
+                }
+            }
+            vowel += 1;
+        }
+    }
+    (response, choice)
+}
+
 // egui does not shape combining accents consistently in all fonts. Render the
 // clean word and draw the accent over its vowel, as in the poem itself.
 fn stress_option(
@@ -3828,6 +3928,68 @@ fn format_count(value: usize) -> String {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+
+    #[test]
+    fn manual_stress_requires_double_click_on_a_vowel() {
+        for (character, expected) in [(5, Some(2)), (2, None)] {
+            let ctx = egui::Context::default();
+            let mut time = 0.0;
+            let mut run = |events: Vec<egui::Event>| {
+                time += 0.016;
+                let mut target = egui::Pos2::ZERO;
+                let mut choice = None;
+                let output = ctx.run(
+                    egui::RawInput {
+                        time: Some(time),
+                        events,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(500.0, 300.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let (response, selected) = manual_stress_word(ui, "выходит", None);
+                            choice = selected;
+                            let galley = ui.fonts(|fonts| {
+                                fonts.layout_no_wrap(
+                                    "выходит".into(),
+                                    FontId::proportional(20.0),
+                                    INK,
+                                )
+                            });
+                            target = galley.rows[0].glyphs[character].logical_rect().center()
+                                + response.rect.min.to_vec2();
+                        });
+                    },
+                );
+                (target, choice, output.platform_output.cursor_icon)
+            };
+            run(vec![]);
+            let (target, _, _) = run(vec![]);
+            let (_, choice, cursor) = run(vec![egui::Event::PointerMoved(target)]);
+            assert!(choice.is_none());
+            if expected.is_some() {
+                assert_eq!(cursor, egui::CursorIcon::PointingHand);
+            }
+            for click in 0..2 {
+                for pressed in [true, false] {
+                    let (_, choice, _) = run(vec![egui::Event::PointerButton {
+                        pos: target,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }]);
+                    if click == 0 || pressed {
+                        assert!(choice.is_none());
+                    } else {
+                        assert_eq!(choice, expected);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn unresolved_highlights_preserve_unicode_and_cover_line_endings() {

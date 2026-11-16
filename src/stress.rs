@@ -87,7 +87,7 @@ pub fn word_at(text: &str, byte: usize) -> Option<Range<usize>> {
         .cloned()
 }
 
-fn dictionary_choices(word: &str, lexicon: Option<&Lexicon>) -> Vec<usize> {
+pub fn dictionary_choices(word: &str, lexicon: Option<&Lexicon>) -> Vec<usize> {
     let Some(lexicon) = lexicon else {
         return vec![];
     };
@@ -331,6 +331,35 @@ mod tests {
         rebase(&shifted, &changed, &mut marks);
         assert!(marks.is_empty());
     }
+    #[test]
+    fn dictionary_choices_are_not_all_vowels_or_manual_overrides() {
+        let lexicon = Lexicon::from_entries(
+            vec![0, 1]
+                .into_iter()
+                .map(|stress| Entry {
+                    word: "выходит".into(),
+                    stress,
+                    part_of_speech: "глагол".into(),
+                })
+                .collect(),
+            "fixture".into(),
+        );
+        let analysis = analyze(
+            "Выходит",
+            &[Mark {
+                start: 0,
+                word: "Выходит".into(),
+                vowel: Some(2),
+            }],
+            Some(&lexicon),
+        );
+        let token = &analysis.tokens[0];
+        assert_eq!(token.choices, vec![0, 1]);
+        assert_eq!(token.selected, Some(2));
+        assert_eq!(token.source, Source::Manual);
+        assert!(dictionary_choices("абракадабра", Some(&lexicon)).is_empty());
+    }
+
     #[test]
     fn copying_omits_unnecessary_marks_but_keeps_user_written_accents() {
         let text = "Дом и ёлочка, ВСЁ, за́мок, замок и фыжобряк.";

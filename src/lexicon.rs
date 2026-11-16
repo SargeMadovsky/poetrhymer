@@ -501,6 +501,9 @@ mod tests {
     #[ignore = "requires the user's local Rhymes installation; no dictionary is distributed"]
     fn local_dictionary_contains_required_forms_and_stresses() {
         let lexicon = Lexicon::load_rhymes(Path::new("Rhymes 3")).unwrap();
+        let mut exit_stresses = lexicon.stresses("выходит");
+        exit_stresses.sort_unstable();
+        assert_eq!(exit_stresses, vec![0, 1]);
         assert!(lexicon.source.contains("168634 общих списков"));
         assert_eq!(lexicon.entries.len(), 3_139_098);
         assert!(lexicon.entries.len() > 2_000_000);
