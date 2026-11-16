@@ -1,0 +1,26 @@
+[package]
+name = "poetrhymer"
+version = "0.1.1"
+edition = "2021"
+default-run = "poetrhymer"
+description = "Локальный редактор стихов и песен"
+
+[dependencies]
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = "0.15"
+flate2 = "1"
+encoding_rs = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+ed25519-dalek = "2.2"
+sha2 = "0.10"
+hex = "0.4"
+semver = "1"
+self-replace = "1.5"
+tempfile = "3"
+
+[profile.release]
+opt-level = 2

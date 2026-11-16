@@ -1,0 +1,14 @@
+/target/
+/tmp/
+/dictionary/
+/Rhymes 3/
+/local-data/
+*.poetrhymer
+/Poetrhymer.exe
+
+
+/secrets/
+/dist/
+*.pfx
+*.key
+*.pem
