@@ -2,7 +2,7 @@
 
 Редактор русских стихов и песен с подбором рифм. **Работает в связке с бесплатной [Rhymes 3](https://rifmovnik.ru/) — использует её словарь рифм.** Текст и словарь остаются на вашем компьютере, а каждую замену выбираете вы.
 
-**[Скачать для Windows](https://github.com/SargeMadovsky/poetrhymer/releases/latest)** · Windows x64 · v0.3.4
+**[Скачать для Windows](https://github.com/SargeMadovsky/poetrhymer/releases/latest)** · Windows x64 · v0.3.5
 
 [![Poetrhymer: редактор стихов с подсветкой последних слов и панелью подбора рифм](assets/readme/poetrhymer.png)](assets/readme/poetrhymer.png)
 
@@ -92,3 +92,5 @@ cargo build --release --locked --bin poetrhymer
 [Подготовка выпуска и проверка подписей](release/README.md) · [План развития](docs/PLAN.md) · [Источники данных](docs/DATA_SOURCES.md)
 
 Код распространяется по лицензии [MIT](LICENSE). Она не распространяется на сторонние словари; зависимости сохраняют свои лицензии.
+
+Размер и положение главного окна сохраняются между запусками отдельно от документа.

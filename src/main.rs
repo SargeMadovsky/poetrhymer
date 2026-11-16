@@ -27,6 +27,12 @@ fn main() -> eframe::Result {
             .with_icon(icon)
             .with_inner_size([1320.0, 860.0])
             .with_min_inner_size([980.0, 760.0]),
+        persist_window: !std::env::args().any(|arg| arg == "--smoke-test"),
+        persistence_path: Some(if std::env::args().any(|arg| arg == "--smoke-test") {
+            storage::app_directory().join("tmp/smoke-test/window.ron")
+        } else {
+            storage::data_directory().join("window.ron")
+        }),
         ..Default::default()
     };
     eframe::run_native(

@@ -3358,6 +3358,10 @@ impl PoetApp {
 }
 
 impl eframe::App for PoetApp {
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.restart_frame(ctx) {
             return;
