@@ -92,6 +92,7 @@ pub struct PoetApp {
     requested_cursor: Option<usize>,
     requested_scroll: Option<usize>,
     editor_scroll: f32,
+    visible_section: Option<usize>,
     update_busy: bool,
     update_available: Option<crate::updater::Manifest>,
     update_message: String,
@@ -216,6 +217,7 @@ impl PoetApp {
             requested_cursor: None,
             requested_scroll: None,
             editor_scroll: 0.0,
+            visible_section: None,
             update_busy: false,
             update_available: None,
             update_message: String::new(),
@@ -997,7 +999,11 @@ impl PoetApp {
                 let lines = core::parse_lines(&self.text);
                 let sections: Vec<_> = lines
                     .iter()
-                    .filter_map(|line| line.section.as_ref().map(|title| (title, line.span.start)))
+                    .filter_map(|line| {
+                        line.section
+                            .as_ref()
+                            .map(|title| (title, line.span.start, line.index + 1))
+                    })
                     .collect();
                 if sections.is_empty() {
                     ui.label(
@@ -1008,17 +1014,23 @@ impl PoetApp {
                         .size(13.0),
                     );
                 }
-                for (title, start) in sections {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 34.0],
-                            egui::Button::new(title).frame(false),
-                        )
-                        .clicked()
-                    {
-                        self.navigate_to(start);
-                    }
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("section_navigation")
+                    .max_height((ui.available_height() - 100.0).max(36.0))
+                    .show(ui, |ui| {
+                        for (title, start, line) in sections {
+                            let active = self.visible_section == Some(start);
+                            let response = ui
+                                .push_id(start, |ui| outline_link(ui, title, active, line))
+                                .inner;
+                            if response.has_focus() {
+                                response.scroll_to_me(None);
+                            }
+                            if response.clicked() {
+                                self.navigate_to(start);
+                            }
+                        }
+                    });
                 ui.add_space(22.0);
                 ui.separator();
                 ui.add_space(14.0);
@@ -1303,6 +1315,19 @@ impl PoetApp {
                             .layouter(&mut layouter)
                             .show(ui);
                         let numbers = core::verse_numbers(&self.text);
+                        // Track the section at the top reading edge, including wrapped lines.
+                        // Include the first line's height: the scroll clip can start
+                        // above the text padding even when its heading is at the top.
+                        let reading_y = ui.clip_rect().top().max(output.galley_pos.y) + 32.0;
+                        let cursor = output.galley.cursor_from_pos(egui::vec2(0.0, reading_y - output.galley_pos.y));
+                        let byte = core::char_to_byte(&self.text, cursor.ccursor.index);
+                        let section = core::parse_lines(&self.text).iter()
+                            .take_while(|line| line.span.start <= byte)
+                            .filter(|line| line.section.is_some()).last().map(|line| line.span.start);
+                        if section != self.visible_section {
+                            self.visible_section = section;
+                            ctx.request_repaint();
+                        }
                         let mut line = 0;
                         let mut first_row = true;
                         for row in &output.galley.rows {
@@ -1573,6 +1598,18 @@ impl PoetApp {
         {
             if self.editor_scroll < 1500.0 {
                 finish(ctx, Err("second section navigation failed".into()));
+                return;
+            }
+            if self.visible_section != self.text.find("[Проверка перехода]") {
+                finish(
+                    ctx,
+                    Err(format!(
+                        "visible section indicator: actual {:?}, expected {:?}, scroll {}",
+                        self.visible_section,
+                        self.text.find("[Проверка перехода]"),
+                        self.editor_scroll
+                    )),
+                );
                 return;
             }
             self.set_status(
@@ -1875,6 +1912,58 @@ impl eframe::App for PoetApp {
     }
 }
 
+fn outline_link(ui: &mut egui::Ui, title: &str, active: bool, line: usize) -> egui::Response {
+    let response = ui
+        .scope(|ui| {
+            let visuals = ui.visuals_mut();
+            visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+            visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(45, 63, 84);
+            visuals.widgets.hovered.bg_stroke =
+                Stroke::new(1.0_f32, Color32::from_rgb(113, 140, 171));
+            visuals.widgets.active.weak_bg_fill = Color32::from_rgb(58, 77, 100);
+            visuals.selection.bg_fill = Color32::from_rgb(64, 53, 40);
+            visuals.selection.stroke = Stroke::NONE;
+            let text = RichText::new(title).color(if active {
+                ACCENT
+            } else {
+                Color32::from_rgb(174, 204, 234)
+            });
+            let text = if active { text.strong() } else { text };
+            ui.add_sized(
+                [ui.available_width(), 36.0],
+                egui::Button::new(text).wrap().selected(active),
+            )
+        })
+        .inner
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("Перейти к секции «{title}» · строка {line}"));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            active,
+            format!("{title}, строка {line}"),
+        )
+    });
+    if active {
+        let rect = egui::Rect::from_min_max(
+            response.rect.left_top() + egui::vec2(1.0, 5.0),
+            response.rect.left_bottom() + egui::vec2(4.0, -5.0),
+        );
+        ui.painter().rect_filled(rect, 1.0, ACCENT);
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            4.0,
+            Stroke::new(2.0_f32, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
+}
+
 fn configure_style(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     let mut fonts = egui::FontDefinitions::default();
@@ -1983,4 +2072,77 @@ fn format_count(value: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    #[test]
+    fn outline_links_have_pointer_and_native_keyboard_activation() {
+        let ctx = egui::Context::default();
+        let mut bounds = egui::Rect::NOTHING;
+        let mut id = egui::Id::NULL;
+        let mut run = |events: Vec<egui::Event>, focus: bool| {
+            let mut clicked = false;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(175.0, 240.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response =
+                            outline_link(ui, "Бридж — торжественно, почти патриотически, с инструментальным вступлением и долгой паузой", false, 17);
+                        bounds = response.rect;
+                        id = response.id;
+                        if focus {
+                            response.request_focus();
+                        }
+                        clicked = response.clicked();
+                    });
+                },
+            );
+            (output, clicked, bounds, id)
+        };
+        let (_, _, rect, _) = run(vec![], false);
+        assert!(
+            rect.height() > 36.0,
+            "long section names must wrap without clipping: {rect:?}"
+        );
+        let (output, clicked, _, id) = run(vec![egui::Event::PointerMoved(rect.center())], true);
+        assert!(!clicked);
+        assert_eq!(
+            output.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let (_, clicked, _, _) = run(
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                false,
+            );
+            assert!(clicked, "section must activate from {key:?}");
+            run(
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                false,
+            );
+        }
+    }
 }

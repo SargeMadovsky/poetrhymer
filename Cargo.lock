@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "poetrhymer"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ed25519-dalek",
  "eframe",
