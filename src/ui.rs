@@ -248,10 +248,11 @@ impl PoetApp {
                 let parts = lexicon
                     .entries
                     .iter()
-                    .map(|entry| entry.part_of_speech.clone())
+                    .map(|entry| entry.part_of_speech.as_str())
                     .filter(|part| !part.is_empty())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
+                    .map(str::to_owned)
                     .collect();
                 (Arc::new(lexicon), parts)
             });
@@ -272,7 +273,7 @@ impl PoetApp {
     fn schedule_search(&mut self) {
         self.invalidate_search();
         if self.selection.is_some() && !self.anchor.trim().is_empty() {
-            self.search_due = Some(Instant::now() + Duration::from_millis(200));
+            self.search_due = Some(Instant::now() + Duration::from_millis(50));
         }
     }
 
@@ -772,7 +773,7 @@ impl PoetApp {
             ui.add_space(8.0);
             let visible_count = self.candidates.iter().filter(|candidate| !self.closer_only || candidate.score >= 120).count();
             if self.dictionary_loading {
-                ui.horizontal(|ui| { ui.spinner(); ui.label("Читаем словарь Rhymes…"); });
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Подготавливаем словарь Rhymes…"); });
             } else if self.dictionary_error.is_some() {
                 ui.colored_label(Color32::LIGHT_RED, "Словарь не подключён");
                 if ui.button("Выбрать папку Rhymes").clicked() { self.show_dictionary = true; }
@@ -921,7 +922,7 @@ impl PoetApp {
             });
             ui.add_space(12.0);
             if self.dictionary_loading {
-                ui.horizontal(|ui| { ui.spinner(); ui.label("Читаем словарь…"); });
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Подготавливаем словарь…"); });
             } else if let Some(error) = &self.dictionary_error {
                 ui.colored_label(Color32::LIGHT_RED, error);
             } else if let Some(lexicon) = &self.lexicon {
@@ -1196,7 +1197,11 @@ impl eframe::App for PoetApp {
             || self.dictionary_loading
             || self.search_loading
         {
-            ctx.request_repaint_after(Duration::from_millis(80));
+            ctx.request_repaint_after(Duration::from_millis(if self.search_due.is_some() {
+                25
+            } else {
+                80
+            }));
         }
     }
 

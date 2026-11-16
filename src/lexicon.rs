@@ -3,7 +3,7 @@
 //! The prototype imports explicit word lists. Shared-list cache references are
 //! counted and omitted until their cache policy has been verified. They must
 //! never be interpreted as invented words or presented as a complete import.
-use std::{fs, io::Read, path::Path};
+use std::{collections::HashMap, fs, io::Read, path::Path};
 
 use encoding_rs::WINDOWS_1251;
 use flate2::read::ZlibDecoder;
@@ -20,6 +20,8 @@ pub struct Entry {
 pub struct Lexicon {
     pub entries: Vec<Entry>,
     pub source: String,
+    word_index: Vec<usize>,
+    rhyme_index: HashMap<String, Vec<usize>>,
 }
 
 const PARTS_OF_SPEECH: [&str; 10] = [
@@ -38,6 +40,47 @@ const MAX_FILE: usize = 128 * 1024 * 1024;
 const MAX_EXPANDED: usize = 256 * 1024 * 1024;
 
 impl Lexicon {
+    /// Indexes contain entry offsets rather than copies of complete words.
+    pub fn from_entries(entries: Vec<Entry>, source: String) -> Self {
+        let mut word_index: Vec<usize> = (0..entries.len()).collect();
+        word_index.sort_by_cached_key(|index| entries[*index].word.to_lowercase());
+        let mut rhyme_index: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            if let Some((tail, _)) =
+                crate::core::rhyme_tail(&entry.word.to_lowercase(), entry.stress)
+            {
+                rhyme_index.entry(tail).or_default().push(index);
+            }
+        }
+        Self {
+            entries,
+            source,
+            word_index,
+            rhyme_index,
+        }
+    }
+
+    pub fn stresses(&self, word: &str) -> Vec<usize> {
+        let start = self
+            .word_index
+            .partition_point(|index| self.entries[*index].word.to_lowercase().as_str() < word);
+        let mut stresses = Vec::new();
+        for index in &self.word_index[start..] {
+            let entry = &self.entries[*index];
+            if entry.word.to_lowercase() != word {
+                break;
+            }
+            if !stresses.contains(&entry.stress) {
+                stresses.push(entry.stress);
+            }
+        }
+        stresses
+    }
+
+    pub fn rhyming_entries(&self, tail: &str) -> &[usize] {
+        self.rhyme_index.get(tail).map_or(&[], Vec::as_slice)
+    }
+
     pub fn load_rhymes(folder: &Path) -> Result<Self, String> {
         let path = folder.join("rus_rhymes.dic");
         let size = fs::metadata(&path)
@@ -53,13 +96,11 @@ impl Lexicon {
         if entries.is_empty() {
             return Err("В словаре не найдено поддерживаемых словоформ".into());
         }
-        Ok(Self {
-            source: format!(
+        let source = format!(
                 "Rhymes 3 · частичный импорт: {} словоформ; пропущено {} записей с общими списками. Источник: {}",
                 entries.len(), skipped_lists, path.display()
-            ),
-            entries,
-        })
+            );
+        Ok(Self::from_entries(entries, source))
     }
 }
 

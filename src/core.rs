@@ -208,7 +208,7 @@ pub struct SearchFilter {
     pub part_of_speech: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub word: String,
     pub stressed: String,
@@ -266,7 +266,7 @@ fn sound(c: char) -> char {
     }
 }
 
-fn rhyme_tail(word: &str, stress: usize) -> Option<(String, Option<char>)> {
+pub(crate) fn rhyme_tail(word: &str, stress: usize) -> Option<(String, Option<char>)> {
     let mut vowels = 0;
     let mut previous = None;
     for (i, c) in word.char_indices() {
@@ -287,12 +287,24 @@ pub fn search_rhymes(
     filter: &SearchFilter,
     limit: usize,
 ) -> Vec<Candidate> {
+    search_rhymes_impl(lexicon, anchor, filter, limit, true)
+}
+
+fn search_rhymes_impl(
+    lexicon: &Lexicon,
+    anchor: &str,
+    filter: &SearchFilter,
+    limit: usize,
+    indexed: bool,
+) -> Vec<Candidate> {
     if limit == 0 {
         return Vec::new();
     }
     let clean = normalized(anchor.trim());
     let stresses: HashSet<usize> = if let Some(stress) = explicit_stress(anchor) {
         [stress].into_iter().collect()
+    } else if indexed {
+        lexicon.stresses(&clean).into_iter().collect()
     } else {
         lexicon
             .entries
@@ -311,7 +323,20 @@ pub fn search_rhymes(
     }
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
-    for entry in &lexicon.entries {
+    let indices = if indexed {
+        let mut indices: Vec<usize> = tails
+            .iter()
+            .flat_map(|(tail, _)| lexicon.rhyming_entries(tail).iter().copied())
+            .collect();
+        // Original import order preserves duplicate and equal-score tie behavior.
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    } else {
+        (0..lexicon.entries.len()).collect()
+    };
+    for index in indices {
+        let entry = &lexicon.entries[index];
         let count = syllables(&entry.word);
         if filter.syllables.is_some_and(|expected| expected != count) {
             continue;
@@ -367,6 +392,101 @@ pub fn search_rhymes(
 mod tests {
     use super::*;
     use crate::lexicon::Entry;
+
+    #[test]
+    fn indexed_search_matches_full_scan_for_variants_filters_and_limits() {
+        let entries = [
+            ("спеша", 1, "деепричастие"),
+            ("фуража", 2, "существительное"),
+            ("Фуража", 2, "существительное"),
+            ("багажа", 2, "существительное"),
+            ("гаража", 2, "существительное"),
+            ("душа", 1, "существительное"),
+            ("душа", 0, "деепричастие"),
+            ("замок", 0, "существительное"),
+            ("замок", 1, "существительное"),
+            ("замок", 1, "глагол"),
+            ("станок", 1, "существительное"),
+            ("рамок", 0, "существительное"),
+            ("ёжа", 1, "существительное"),
+            ("каша", 0, "существительное"),
+        ]
+        .into_iter()
+        .map(|(word, stress, pos)| Entry {
+            word: word.into(),
+            stress,
+            part_of_speech: pos.into(),
+        })
+        .collect();
+        let lexicon = Lexicon::from_entries(entries, "fixture".into());
+        for anchor in [
+            "спеша",
+            "СПЕША",
+            "душа",
+            "ду́ша",
+            "душа́",
+            "замок",
+            "ёжа",
+            "камыша́",
+            "неизвестно",
+            "ка́мыша",
+            "",
+            "x",
+        ] {
+            for syllables in [None, Some(2), Some(3), Some(9)] {
+                for pos in [
+                    None,
+                    Some("существительное".to_owned()),
+                    Some("деепричастие".to_owned()),
+                ] {
+                    let filter = SearchFilter {
+                        syllables,
+                        part_of_speech: pos,
+                    };
+                    for limit in [0, 1, 3, 150] {
+                        assert_eq!(
+                            search_rhymes(&lexicon, anchor, &filter, limit),
+                            search_rhymes_impl(&lexicon, anchor, &filter, limit, false),
+                            "{anchor}/{filter:?}/{limit}"
+                        );
+                    }
+                }
+            }
+        }
+        let empty = Lexicon::from_entries(Vec::new(), "empty".into());
+        assert!(search_rhymes(&empty, "спеша́", &SearchFilter::default(), 150).is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the user's local Rhymes installation; compares old and indexed search"]
+    fn local_index_matches_scan_and_reports_timings() {
+        let started = std::time::Instant::now();
+        let lexicon = Lexicon::load_rhymes(std::path::Path::new("Rhymes 3")).unwrap();
+        println!("Import and index: {:?}", started.elapsed());
+        for anchor in [
+            "спеша",
+            "нами",
+            "замок",
+            "ду́ша",
+            "Петров",
+            "снег",
+            "неизвестно",
+            "а́",
+        ] {
+            let filter = SearchFilter::default();
+            let started = std::time::Instant::now();
+            let baseline = search_rhymes_impl(&lexicon, anchor, &filter, 150, false);
+            let baseline_time = started.elapsed();
+            let started = std::time::Instant::now();
+            let indexed = search_rhymes(&lexicon, anchor, &filter, 150);
+            let indexed_time = started.elapsed();
+            println!(
+                "{anchor}: scan {baseline_time:?}, index {indexed_time:?}, {} results",
+                indexed.len()
+            );
+            assert_eq!(indexed, baseline, "{anchor}");
+        }
+    }
 
     #[test]
     fn markdown_headings_are_not_verse_lines() {
@@ -471,10 +591,7 @@ mod tests {
             part_of_speech: "сущ.".into(),
         })
         .collect();
-        let dictionary = Lexicon {
-            entries,
-            source: "test fixture".into(),
-        };
+        let dictionary = Lexicon::from_entries(entries, "test fixture".into());
         let results = search_rhymes(
             &dictionary,
             "спеша",
