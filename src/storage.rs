@@ -14,6 +14,17 @@ pub struct Session {
     pub rhyme_links: Vec<crate::core::RhymeLink>,
     #[serde(default)]
     pub last_document_folder: Option<PathBuf>,
+    #[serde(default)]
+    pub file_path: Option<PathBuf>,
+}
+
+/// A recovered draft is already safe in local recovery. For a named file,
+/// compare with its actual contents so genuine unsaved edits remain visible.
+pub fn saved_text_after_recovery(text: &str, file_path: Option<&Path>) -> Option<String> {
+    match file_path {
+        Some(path) => read_text(path).ok(),
+        None => Some(text.to_owned()),
+    }
 }
 
 pub fn documents_directory() -> PathBuf {
@@ -146,6 +157,36 @@ mod tests {
             serde_json::from_str(r#"{"text":"строка","dictionary_folder":"Rhymes 3"}"#).unwrap();
         assert!(session.rhyme_links.is_empty());
         assert!(session.document_title.is_none());
+        assert!(session.file_path.is_none());
+    }
+
+    #[test]
+    fn recovered_named_file_uses_disk_baseline_and_roundtrips_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Песня.txt");
+        write_text(&path, "\u{feff}Первая строка\r\nЁж").unwrap();
+        let session = Session {
+            text: "Первая строка\r\nЁж".into(),
+            document_title: Some("Песня".into()),
+            dictionary_folder: String::new(),
+            rhyme_links: vec![],
+            last_document_folder: Some(dir.path().into()),
+            file_path: Some(path.clone()),
+        };
+        let restored: Session =
+            serde_json::from_slice(&serde_json::to_vec(&session).unwrap()).unwrap();
+        assert_eq!(restored.file_path, Some(path.clone()));
+        let baseline = saved_text_after_recovery(&restored.text, restored.file_path.as_deref());
+        assert_eq!(baseline.as_deref(), Some(restored.text.as_str()));
+        assert_ne!(baseline.as_deref(), Some("Новая правка"));
+        assert_eq!(
+            saved_text_after_recovery("", Some(&dir.path().join("missing.txt"))),
+            None
+        );
+        assert_eq!(
+            saved_text_after_recovery("Автосохранённый черновик", None).as_deref(),
+            Some("Автосохранённый черновик")
+        );
     }
     #[test]
     fn save_twice_preserves_previous_file_and_utf8() {

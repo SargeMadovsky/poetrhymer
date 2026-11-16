@@ -53,7 +53,7 @@ pub struct PoetApp {
     history_selected: Option<String>,
     history_preview: Option<DocumentState>,
     text: String,
-    saved_text: String,
+    saved_text: Option<String>,
     saved_title: Option<String>,
     document_title: Option<String>,
     file_path: Option<PathBuf>,
@@ -120,6 +120,7 @@ impl PoetApp {
             dictionary_folder: default_folder.to_string_lossy().into_owned(),
             rhyme_links: Vec::new(),
             last_document_folder: None,
+            file_path: None,
         });
         let history_temp =
             smoke_test.then(|| tempfile::tempdir().expect("smoke-test history directory"));
@@ -128,6 +129,7 @@ impl PoetApp {
             .map(|dir| dir.path().to_owned())
             .unwrap_or_else(|| storage::data_directory().join("history"));
         let repaint = cc.egui_ctx.clone();
+        let fallback_path = session.file_path.clone();
         let (history, document_id, file_path, history_error) =
             match history::History::open(history_path, move || repaint.request_repaint()) {
                 Ok((history, previous, warning)) => {
@@ -138,11 +140,11 @@ impl PoetApp {
                         recovered = true;
                         (summary.document, summary.path)
                     } else {
-                        (history::new_document(), None)
+                        (history::new_document(), fallback_path.clone())
                     };
                     (Some(history), document, path, warning)
                 }
-                Err(error) => (None, history::new_document(), None, Some(error)),
+                Err(error) => (None, history::new_document(), fallback_path, Some(error)),
             };
         let saved_folder = PathBuf::from(&session.dictionary_folder);
         let legacy_default = storage::app_directory().join("Rhymes 3");
@@ -165,16 +167,8 @@ impl PoetApp {
             history_entries: Vec::new(),
             history_selected: None,
             history_preview: None,
-            saved_text: if recovered {
-                String::new()
-            } else {
-                session.text.clone()
-            },
-            saved_title: if recovered {
-                None
-            } else {
-                session.document_title.clone()
-            },
+            saved_text: Some(session.text.clone()),
+            saved_title: session.document_title.clone(),
             document_title: session.document_title,
             text: session.text,
             file_path,
@@ -206,7 +200,7 @@ impl PoetApp {
             tx,
             rx,
             status: if recovered {
-                "Восстановлен последний текст. Сохраните его в файл.".into()
+                "Восстановлен последний текст.".into()
             } else {
                 "Нажмите на последнее слово строки, чтобы подобрать замену.".into()
             },
@@ -227,6 +221,9 @@ impl PoetApp {
             smoke_stage: 0,
             smoke_started: Instant::now(),
         };
+        if recovered {
+            app.restore_recovered_document(app.snapshot(), app.file_path.clone());
+        }
         app.rhyme_links.retain(|link| link.is_valid(&app.text));
         app.record_revision("Начало сессии");
         if !recovered {
@@ -239,6 +236,17 @@ impl PoetApp {
             app.check_updates(&cc.egui_ctx);
         }
         app
+    }
+
+    fn recovery_session(&self) -> storage::Session {
+        storage::Session {
+            text: self.text.clone(),
+            document_title: self.document_title.clone(),
+            dictionary_folder: self.dictionary_folder.clone(),
+            rhyme_links: self.rhyme_links.clone(),
+            last_document_folder: self.last_document_folder.clone(),
+            file_path: self.file_path.clone(),
+        }
     }
 
     fn record_revision(&mut self, reason: &str) {
@@ -508,7 +516,8 @@ impl PoetApp {
     }
 
     fn is_dirty(&self) -> bool {
-        self.text != self.saved_text || self.document_title != self.saved_title
+        self.saved_text.as_deref() != Some(self.text.as_str())
+            || self.document_title != self.saved_title
     }
 
     fn load_dictionary(&mut self, ctx: &egui::Context) {
@@ -708,6 +717,13 @@ impl PoetApp {
         self.rhyme_links = state.rhyme_links;
     }
 
+    fn restore_recovered_document(&mut self, state: DocumentState, path: Option<PathBuf>) {
+        self.restore_snapshot(state);
+        self.file_path = path;
+        self.saved_text = storage::saved_text_after_recovery(&self.text, self.file_path.as_deref());
+        self.saved_title = self.document_title.clone();
+    }
+
     fn format_document(&mut self) {
         let formatted = formatter::format_paste(&self.text, true);
         let title = formatted.title.or_else(|| self.document_title.clone());
@@ -832,11 +848,15 @@ impl PoetApp {
             self.file_path.clone()
         };
         let Some(path) = path else { return false };
+        self.save_to(path)
+    }
+
+    fn save_to(&mut self, path: PathBuf) -> bool {
         match storage::write_text(&path, &self.text) {
             Ok(()) => {
                 self.last_document_folder = path.parent().map(std::path::Path::to_owned);
                 self.file_path = Some(path);
-                self.saved_text = self.text.clone();
+                self.saved_text = Some(self.text.clone());
                 self.saved_title = self.document_title.clone();
                 self.record_revision("Сохранение файла");
                 self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
@@ -868,7 +888,7 @@ impl PoetApp {
             PendingAction::CopyRevision(snapshot) => {
                 self.replace_document(snapshot.text.clone(), None);
                 self.restore_snapshot(snapshot);
-                self.saved_text.clear();
+                self.saved_text = None;
                 self.saved_title = None;
                 self.after_document_change("Копия версии");
                 self.set_status(
@@ -889,7 +909,7 @@ impl PoetApp {
         self.document_title = None;
         self.saved_title = None;
         self.text = text;
-        self.saved_text = self.text.clone();
+        self.saved_text = Some(self.text.clone());
         if let Some(parent) = path.as_deref().and_then(std::path::Path::parent) {
             self.last_document_folder = Some(parent.to_owned());
         }
@@ -1442,6 +1462,106 @@ impl PoetApp {
         }
     }
 
+    fn smoke_file_saving(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        fn check(ok: bool, message: &str) -> Result<(), String> {
+            if ok {
+                Ok(())
+            } else {
+                Err(message.into())
+            }
+        }
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let original = dir.path().join("исходник.txt");
+        storage::write_text(&original, "Первая строка\n")?;
+        self.execute_action(PendingAction::Open(original.clone()), ctx);
+        check(!self.is_dirty(), "opening a file marked it dirty")?;
+        check(
+            self.file_path.as_ref() == Some(&original),
+            "opening lost the file path",
+        )?;
+        self.text.push_str("Правка\n");
+        self.after_document_change("Проверка сохранения");
+        check(self.is_dirty(), "edit was not marked dirty")?;
+        check(self.save(false), "saving the opened file failed")?;
+        check(
+            storage::read_text(&original)? == self.text,
+            "save did not overwrite the opened file",
+        )?;
+        self.document_title = Some("Название песни".into());
+        check(self.save(false), "saving title metadata failed")?;
+
+        let clean = self.snapshot();
+        let session: storage::Session = serde_json::from_slice(
+            &serde_json::to_vec(&self.recovery_session()).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        check(
+            session.file_path.as_ref() == Some(&original),
+            "fallback recovery lost file path",
+        )?;
+        self.restore_recovered_document(clean.clone(), session.file_path);
+        check(!self.is_dirty(), "unchanged recovered file marked dirty")?;
+        let mut draft = clean.clone();
+        draft.text.push_str("Восстановленная правка\n");
+        self.restore_recovered_document(draft, Some(original.clone()));
+        check(self.is_dirty(), "real unsaved recovery edit was hidden")?;
+        check(self.save(false), "saving recovered file failed")?;
+        check(
+            self.file_path.as_ref() == Some(&original),
+            "recovered save changed the target",
+        )?;
+        check(
+            storage::read_text(&original)? == self.text,
+            "recovered save did not update original",
+        )?;
+
+        let original_text = self.text.clone();
+        let copy = dir.path().join("копия.txt");
+        check(self.save_to(copy.clone()), "save as failed")?;
+        self.text.push_str("Правка копии\n");
+        self.after_document_change("Проверка копии");
+        check(self.save(false), "subsequent save of copy failed")?;
+        check(
+            self.file_path.as_ref() == Some(&copy),
+            "save as target was not remembered",
+        )?;
+        check(storage::read_text(&copy)? == self.text, "copy not updated")?;
+        check(
+            storage::read_text(&original)? == original_text,
+            "copy save overwrote original",
+        )?;
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").map_err(|e| e.to_string())?;
+        self.text.push_str("Несохранённая правка\n");
+        check(
+            !self.save_to(blocked.join("poem.txt")),
+            "invalid save unexpectedly succeeded",
+        )?;
+        check(
+            self.file_path.as_ref() == Some(&copy) && self.is_dirty(),
+            "failed save changed target or cleared dirty state",
+        )?;
+
+        self.restore_recovered_document(clean.clone(), None);
+        check(!self.is_dirty(), "recovered untitled draft marked dirty")?;
+        self.text.push_str("Новая правка\n");
+        check(self.is_dirty(), "new edit to recovered draft was hidden")?;
+        let draft_path = dir.path().join("черновик.txt");
+        check(
+            self.save_to(draft_path.clone()),
+            "first save of draft failed",
+        )?;
+        self.text.push_str("Ещё правка\n");
+        check(self.save(false), "repeat save of draft failed")?;
+        check(
+            storage::read_text(&draft_path)? == self.text,
+            "repeat save did not update draft file",
+        )?;
+        self.restore_recovered_document(clean, Some(dir.path().join("missing.txt")));
+        check(self.is_dirty(), "missing file incorrectly marked saved")?;
+        Ok(())
+    }
+
     // Developer-only end-to-end command test. It uses a separate fixture,
     // never restores or writes the user's recovery file, and captures the GPU frame.
     fn smoke_update(&mut self, ctx: &egui::Context) {
@@ -1450,7 +1570,11 @@ impl PoetApp {
             let _ = std::fs::create_dir_all(&directory);
             let report = match result {
                 Ok(()) => {
-                    "PASS: import, search, replace, undo, redo, preview and screenshot".into()
+                    if std::env::args().any(|arg| arg == "--smoke-files") {
+                        "PASS: opened/recovered file saving, save-as, repeated save and failed write handling".into()
+                    } else {
+                        "PASS: import, search, replace, undo, redo, preview and screenshot".into()
+                    }
                 }
                 Err(e) => format!("FAIL: {e}"),
             };
@@ -1490,13 +1614,19 @@ impl PoetApp {
                     return;
                 }
                 self.undo();
-                self.saved_text = self.text.clone();
+                self.saved_text = Some(self.text.clone());
                 self.select_word(self.text.find("фуража").unwrap());
                 self.smoke_stage = 1;
             } else {
                 finish(ctx, Err("багажа missing from candidates".into()));
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
+            if std::env::args().any(|arg| arg == "--smoke-files") {
+                let result = self.smoke_file_saving(ctx);
+                finish(ctx, result);
+                self.smoke_stage = 4;
+                return;
+            }
             if std::env::args().any(|arg| arg == "--smoke-navigation") {
                 let text = format!("[Начало]\n{}\n[Проверка перехода]\nДлинная строка {}\nВторая строка\nТретья строка\nЧетвёртая строка\n\n{}", "Строка до секции\n".repeat(80), "со словами ".repeat(25), "Строка после секции\n".repeat(80));
                 self.replace_document(text, None);
@@ -1671,13 +1801,7 @@ impl PoetApp {
                 finish(ctx, Err("paste redo mismatch".into()));
                 return;
             }
-            let session = storage::Session {
-                text: self.text.clone(),
-                document_title: self.document_title.clone(),
-                dictionary_folder: self.dictionary_folder.clone(),
-                rhyme_links: self.rhyme_links.clone(),
-                last_document_folder: self.last_document_folder.clone(),
-            };
+            let session = self.recovery_session();
             let restored: storage::Session =
                 serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
             if restored.text != self.text || restored.document_title != self.document_title {
@@ -1810,13 +1934,7 @@ impl eframe::App for PoetApp {
         }
         if !self.smoke_test && self.autosave_due.is_some_and(|due| Instant::now() >= due) {
             self.autosave_due = None;
-            if let Err(error) = storage::save_recovery(&storage::Session {
-                text: self.text.clone(),
-                document_title: self.document_title.clone(),
-                dictionary_folder: self.dictionary_folder.clone(),
-                rhyme_links: self.rhyme_links.clone(),
-                last_document_folder: self.last_document_folder.clone(),
-            }) {
+            if let Err(error) = storage::save_recovery(&self.recovery_session()) {
                 self.set_status(
                     format!("Не удалось сохранить восстановление: {error}"),
                     true,
@@ -1902,13 +2020,7 @@ impl eframe::App for PoetApp {
         if self.smoke_test {
             return;
         }
-        let _ = storage::save_recovery(&storage::Session {
-            text: self.text.clone(),
-            document_title: self.document_title.clone(),
-            dictionary_folder: self.dictionary_folder.clone(),
-            rhyme_links: self.rhyme_links.clone(),
-            last_document_folder: self.last_document_folder.clone(),
-        });
+        let _ = storage::save_recovery(&self.recovery_session());
     }
 }
 
