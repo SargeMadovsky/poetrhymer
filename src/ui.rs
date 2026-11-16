@@ -1036,7 +1036,7 @@ impl PoetApp {
                 }
                 egui::ScrollArea::vertical()
                     .id_salt("section_navigation")
-                    .max_height((ui.available_height() - 100.0).max(36.0))
+                    .max_height(ui.available_height())
                     .show(ui, |ui| {
                         for (title, start, line) in sections {
                             let active = self.visible_section == Some(start);
@@ -1051,25 +1051,6 @@ impl PoetApp {
                             }
                         }
                     });
-                ui.add_space(22.0);
-                ui.separator();
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.undo.is_empty(), egui::Button::new("Отменить"))
-                        .on_hover_text("Ctrl+Z")
-                        .clicked()
-                    {
-                        self.undo();
-                    }
-                    if ui
-                        .add_enabled(!self.redo.is_empty(), egui::Button::new("Повторить"))
-                        .on_hover_text("Ctrl+Y")
-                        .clicked()
-                    {
-                        self.redo();
-                    }
-                });
             });
     }
 
@@ -1230,18 +1211,26 @@ impl PoetApp {
                     .inner_margin(28.0),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("ВАШ ТЕКСТ").size(11.0).strong().color(MUTED));
-                    if ui.small_button("Форматировать").on_hover_text("Убрать Markdown, вынести # название в верхнюю панель и оформить секции в [скобках]").clicked() {
+                    ui.add_space(8.0);
+                    if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Отменить").wrap_mode(egui::TextWrapMode::Extend))
+                        .on_hover_text("Отменить последнюю правку · Ctrl+Z").clicked() {
+                        self.undo();
+                    }
+                    if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Повторить").wrap_mode(egui::TextWrapMode::Extend))
+                        .on_hover_text("Повторить отменённую правку · Ctrl+Y / Ctrl+Shift+Z").clicked() {
+                        self.redo();
+                    }
+                    ui.add_space(8.0);
+                    if ui.add(egui::Button::new("Форматировать").wrap_mode(egui::TextWrapMode::Extend)).on_hover_text("Убрать Markdown, вынести # название в верхнюю панель и оформить секции в [скобках]").clicked() {
                         self.format_document();
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("Последние слова — точки для новых рифм")
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                    });
+                    if ui.available_width() > 300.0 {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("Последние слова — точки для новых рифм").size(12.0).color(MUTED));
+                        });
+                    }
                 });
                 ui.add_space(24.0);
                 let editor_id = ui.make_persistent_id("poem_text");
