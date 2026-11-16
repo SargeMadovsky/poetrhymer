@@ -244,23 +244,48 @@ pub fn accented(word: &str, vowel: usize) -> String {
 }
 
 pub fn export(text: &str, analysis: &Analysis) -> String {
+    export_range(text, analysis, 0..text.len())
+}
+
+/// Copy an original UTF-8 range, adding marks only to vowels inside it.
+/// Keep whole-word analysis so selecting part of a word doesn't change its stress.
+pub fn export_range(text: &str, analysis: &Analysis, range: Range<usize>) -> String {
+    if text.get(range.clone()).is_none() {
+        return String::new();
+    }
     let mut out = String::new();
-    let mut cursor = 0;
+    let mut cursor = range.start;
     for token in &analysis.tokens {
-        // Also protect callers from stale analysis.
-        if token.span.start < cursor || text.get(token.span.clone()) != Some(token.word.as_str()) {
+        if token.span.start >= range.end {
+            break;
+        }
+        if token.span.end <= range.start
+            || text.get(token.span.clone()) != Some(token.word.as_str())
+            || !needs_mark(&token.word)
+            || token.word.contains('\u{301}')
+        {
             continue;
         }
-        out.push_str(&text[cursor..token.span.start]);
-        match token.selected {
-            Some(vowel) if needs_mark(&token.word) && !token.word.contains('\u{301}') => {
-                out.push_str(&accented(&token.word, vowel))
-            }
-            _ => out.push_str(&token.word),
+        let Some(vowel) = token.selected else {
+            continue;
+        };
+        let Some((offset, letter)) = token
+            .word
+            .char_indices()
+            .filter(|(_, c)| is_vowel(*c))
+            .nth(vowel)
+        else {
+            continue;
+        };
+        let start = token.span.start + offset;
+        let end = start + letter.len_utf8();
+        if start >= range.start && end <= range.end && end > cursor {
+            out.push_str(&text[cursor..end]);
+            out.push('\u{301}');
+            cursor = end;
         }
-        cursor = token.span.end;
     }
-    out.push_str(&text[cursor..]);
+    out.push_str(&text[cursor..range.end]);
     out
 }
 
@@ -331,6 +356,41 @@ mod tests {
         rebase(&shifted, &changed, &mut marks);
         assert!(marks.is_empty());
     }
+    #[test]
+    fn copied_ranges_keep_word_stress_and_only_selected_characters() {
+        let text = "Начало\nЗамок и ёлочка\nФиниш";
+        let start = text.find("Замок").unwrap();
+        let marks = [Mark {
+            start,
+            word: "Замок".into(),
+            vowel: Some(1),
+        }];
+        let analysis = analyze(text, &marks, None);
+        let end = text.find("Финиш").unwrap() + "Ф".len();
+        assert_eq!(
+            export_range(text, &analysis, start + "З".len()..end),
+            "амо́к и ёлочка\nФ"
+        );
+        let vowel = start + "Зам".len();
+        assert_eq!(export_range(text, &analysis, vowel..vowel + "о".len()), "о́");
+        assert_eq!(export_range(text, &analysis, start..vowel), "Зам");
+        assert_eq!(
+            export_range(text, &analysis, vowel + "о".len()..start + "Замок".len()),
+            "к"
+        );
+        assert_eq!(export_range(text, &analysis, start..start), "");
+        assert_eq!(export_range(text, &analysis, 1..text.len()), ""); // UTF-8 boundary
+        assert_eq!(export(text, &analysis), "Начало\nЗамо́к и ёлочка\nФиниш");
+        let changed = text.replace("Замок", "Домок");
+        assert_eq!(
+            export_range(&changed, &analysis, start..start + "Домок".len()),
+            "Домок"
+        );
+        let explicit = "За́мок и дом";
+        let analysis = analyze(explicit, &[], None);
+        assert_eq!(export_range(explicit, &analysis, 0.."За́мок".len()), "За́мок");
+    }
+
     #[test]
     fn dictionary_choices_are_not_all_vowels_or_manual_overrides() {
         let lexicon = Lexicon::from_entries(

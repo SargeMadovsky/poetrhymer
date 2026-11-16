@@ -1966,12 +1966,25 @@ impl PoetApp {
         let Some(analysis) = &self.stress_analysis else {
             return;
         };
-        let text = stress::export(&self.text, analysis);
+        let selected = self
+            .poem_editor_id
+            .and_then(|id| egui::TextEdit::load_state(ctx, id))
+            .and_then(|state| state.cursor.char_range())
+            .filter(|range| range.primary.index != range.secondary.index)
+            .map(|range| {
+                core::char_to_byte(&self.text, range.primary.index.min(range.secondary.index))
+                    ..core::char_to_byte(&self.text, range.primary.index.max(range.secondary.index))
+            });
+        let fragment = selected.is_some();
+        let range = selected.unwrap_or(0..self.text.len());
+        let text = stress::export_range(&self.text, analysis, range.clone());
         let unresolved = analysis
             .tokens
             .iter()
             .filter(|token| {
-                stress::needs_mark(&token.word)
+                token.span.start < range.end
+                    && token.span.end > range.start
+                    && stress::needs_mark(&token.word)
                     && matches!(
                         token.source,
                         stress::Source::Unknown | stress::Source::Ambiguous
@@ -1979,12 +1992,17 @@ impl PoetApp {
             })
             .count();
         ctx.copy_text(text);
+        let subject = if fragment {
+            "Фрагмент"
+        } else {
+            "Текст"
+        };
         self.set_status(
             if unresolved == 0 {
-                "Текст с ударениями скопирован.".into()
+                format!("{subject} с ударениями скопирован.")
             } else {
                 format!(
-                    "Текст скопирован. Осталось выбрать ударение в {} словах.",
+                    "{subject} скопирован. Осталось выбрать ударение в {} словах.",
                     unresolved
                 )
             },
@@ -2317,7 +2335,7 @@ impl PoetApp {
                         self.schedule_stress();
                         self.autosave_due=Some(Instant::now()+Duration::from_millis(800));
                     }
-                    if self.stress_mode && ui.add_enabled(self.stress_analysis.is_some(), egui::Button::new("Скопировать с ударениями").wrap_mode(egui::TextWrapMode::Extend)).clicked() { self.copy_stress(ctx); }
+                    if self.stress_mode && ui.add_enabled(self.stress_analysis.is_some(), egui::Button::new("Скопировать с ударениями").wrap_mode(egui::TextWrapMode::Extend)).on_hover_text("Копирует выделенный фрагмент, а без выделения — весь текст").clicked() { self.copy_stress(ctx); }
                     if !self.stress_mode && !self.meter_mode && ui.available_rect_before_wrap().width() > 300.0 {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(RichText::new("Последние слова — точки для новых рифм").size(12.0).color(MUTED));
@@ -2994,6 +3012,55 @@ impl PoetApp {
                 );
                 return;
             }
+            let editor = self.poem_editor_id.unwrap();
+            let original_state = egui::TextEdit::load_state(ctx, editor).unwrap();
+            let start = core::byte_to_char(&self.text, self.text.find("замок").unwrap());
+            let end = core::byte_to_char(
+                &self.text,
+                self.text.find("Фыжобряк").unwrap() + "Фыжобряк".len(),
+            );
+            for (a, b) in [(start, end), (end, start), (start, start)] {
+                let mut state = original_state.clone();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(a),
+                        egui::text::CCursor::new(b),
+                    )));
+                state.store(ctx, editor);
+                self.copy_stress(ctx);
+                let copied = ctx.output_mut(|output| {
+                    let index = output
+                        .commands
+                        .iter()
+                        .position(|command| matches!(command, egui::OutputCommand::CopyText(_)))?;
+                    match output.commands.remove(index) {
+                        egui::OutputCommand::CopyText(text) => Some(text),
+                        _ => None,
+                    }
+                });
+                let expected = if a == b {
+                    exported.clone()
+                } else {
+                    stress::export_range(
+                        &self.text,
+                        self.stress_analysis.as_deref().unwrap(),
+                        core::char_to_byte(&self.text, start)..core::char_to_byte(&self.text, end),
+                    )
+                };
+                if copied.as_deref() != Some(expected.as_str())
+                    || self.text != before_copy
+                    || self.file_path != before_path
+                    || self.is_dirty() != before_dirty
+                {
+                    finish(
+                        ctx,
+                        Err("selected/reverse/empty selection copy mismatch".into()),
+                    );
+                    return;
+                }
+            }
+            original_state.store(ctx, editor);
             if !exported.contains("замо́к") || self.text.contains('\u{301}') {
                 finish(ctx, Err("stress export/source mismatch".into()));
                 return;
