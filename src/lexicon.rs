@@ -1,8 +1,8 @@
 //! Read-only importer for the local Rhymes 3 dictionary container.
 //!
-//! The prototype imports explicit word lists. Shared-list cache references are
-//! counted and omitted until their cache policy has been verified. They must
-//! never be interpreted as invented words or presented as a complete import.
+//! Imports explicit lists and the seven-slot LRU references used by Rhymes 3.
+//! The cache is reset at each clause block. Counts, masks and references are
+//! validated before reconstructed records are exposed to the editor.
 use std::{collections::HashMap, fs, io::Read, path::Path};
 
 use encoding_rs::WINDOWS_1251;
@@ -38,6 +38,7 @@ const PARTS_OF_SPEECH: [&str; 10] = [
 ];
 const MAX_FILE: usize = 128 * 1024 * 1024;
 const MAX_EXPANDED: usize = 256 * 1024 * 1024;
+const MAX_ENTRIES: usize = 8_000_000;
 
 impl Lexicon {
     /// Indexes contain entry offsets rather than copies of complete words.
@@ -90,16 +91,25 @@ impl Lexicon {
             return Err("Словарь слишком большой для этого прототипа".into());
         }
         let bytes = fs::read(&path).map_err(|e| format!("Ошибка чтения словаря: {e}"))?;
-        let (prefix_data, clause_data) = unpack_container(&bytes)?;
+        let (prefix_data, clause_blocks, expected_forms) = unpack_container(&bytes)?;
         let prefixes = read_prefixes(&prefix_data)?;
-        let (entries, skipped_lists, _shared_field_sum) = read_clauses(&clause_data, &prefixes)?;
+        let (entries, shared_lists, clauses) = read_clauses(&clause_blocks, &prefixes)?;
+        if entries.len() != expected_forms {
+            return Err(format!(
+                "Число словоформ не совпало с метаданными: {} вместо {expected_forms}",
+                entries.len()
+            ));
+        }
         if entries.is_empty() {
             return Err("В словаре не найдено поддерживаемых словоформ".into());
         }
         let source = format!(
-                "Rhymes 3 · частичный импорт: {} словоформ; пропущено {} записей с общими списками. Источник: {}",
-                entries.len(), skipped_lists, path.display()
-            );
+            "Rhymes 3 · прочитано {} словоформ, {} клаузул и {} общих списков. Источник: {}",
+            entries.len(),
+            clauses,
+            shared_lists,
+            path.display()
+        );
         Ok(Self::from_entries(entries, source))
     }
 }
@@ -120,7 +130,9 @@ fn u32_at(data: &[u8], pos: usize) -> Result<u32, String> {
 
 /// The footer describes every compressed or raw block. Its last (20,20)
 /// descriptor accounts for the file header, not another block of user data.
-fn unpack_container(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+type UnpackedDictionary = (Vec<u8>, Vec<Vec<u8>>, usize);
+
+fn unpack_container(data: &[u8]) -> Result<UnpackedDictionary, String> {
     if data.len() < 44 || data.get(..4) != Some(&[0x62, 0x1b, 0x93, 0x10]) {
         return Err("Неподдерживаемый формат rus_rhymes.dic (ожидается Rhymes 3)".into());
     }
@@ -158,7 +170,8 @@ fn unpack_container(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         return Err("Некорректный каталог блоков словаря".into());
     }
     let mut prefix_data = Vec::new();
-    let mut clause_data = Vec::new();
+    let mut clause_blocks = Vec::new();
+    let mut expected_forms = 0;
     let mut cursor = 20usize;
     let mut expanded_sum = footer.len();
     for block in 0..block_count - 1 {
@@ -191,17 +204,26 @@ fn unpack_container(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
             }
             out
         };
+        if block == 0 {
+            if decoded.get(..7) != Some(&[3, 0, 0, 1, 0, 1, 0]) {
+                return Err("Неподдерживаемая версия метаданных словаря Rhymes".into());
+            }
+            expected_forms = u32_at(&decoded, 11)? as usize;
+            if expected_forms == 0 || expected_forms > MAX_ENTRIES {
+                return Err("Неверное число словоформ в метаданных".into());
+            }
+        }
         if block >= groups[1] && block < groups[1] + groups[2] {
             prefix_data.extend(decoded);
         } else if block >= groups[1] + groups[2] {
-            clause_data.extend(decoded);
+            clause_blocks.push(decoded);
         }
         cursor = end;
     }
     if cursor != footer_pos || expanded_sum != expected_expanded {
         return Err("Размеры контейнера не прошли проверку".into());
     }
-    Ok((prefix_data, clause_data))
+    Ok((prefix_data, clause_blocks, expected_forms))
 }
 
 /// One leading control byte copies a prefix; a second copies a suffix too.
@@ -275,67 +297,185 @@ fn vowel_count(text: &str) -> usize {
         .count()
 }
 
-fn read_clauses(data: &[u8], prefixes: &[String]) -> Result<(Vec<Entry>, usize, usize), String> {
+#[derive(Clone)]
+struct Reference {
+    prefix: usize,
+    pos: usize,
+}
+
+struct CachedList {
+    mask: u16,
+    references: Vec<Reference>,
+}
+
+fn read_clauses(
+    blocks: &[Vec<u8>],
+    prefixes: &[String],
+) -> Result<(Vec<Entry>, usize, usize), String> {
     let prefix_stress: Vec<usize> = prefixes.iter().map(|p| vowel_count(p)).collect();
-    let mut cursor = 0;
-    let mut previous = Vec::new();
     let mut entries = Vec::new();
-    let mut skipped_lists = 0;
-    let mut skipped_forms = 0;
-    while cursor < data.len() {
-        previous = front_string(data, &mut cursor, &previous)?;
-        let clause = decode_text(&previous)?;
-        if vowel_count(&clause) == 0 {
-            return Err(format!(
-                "Клаузула без ударной гласной: {clause:?}, смещение {cursor}"
-            ));
-        }
-        let mask = u16_at(data, cursor)?;
-        let count_flags = u16_at(data, cursor + 2)?;
-        cursor += 4;
-        if mask == 0 || mask & !0x3ff != 0 {
-            return Err("Неизвестные части речи в словаре".into());
-        }
-        let count = (count_flags & 0x1fff) as usize;
-        if count_flags >> 13 != 0 {
-            skipped_lists += 1;
-            skipped_forms += count;
-            continue;
-        }
-        let width = if mask.count_ones() > 1 { 4 } else { 3 };
-        let references = data
-            .get(cursor..cursor + count * width)
-            .ok_or("Обрезанный список словоформ")?;
-        for reference in references.chunks_exact(width) {
-            let packed = reference[0] as usize
-                | (reference[1] as usize) << 8
-                | (reference[2] as usize) << 16;
-            let index = packed & 0xfffff;
-            let pos = if width == 4 {
-                reference[3] as usize
-            } else {
-                mask.trailing_zeros() as usize
-            };
-            let prefix = prefixes
-                .get(index)
-                .ok_or("Ссылка на отсутствующую основу")?;
-            if pos >= PARTS_OF_SPEECH.len() || mask & (1 << pos) == 0 {
-                return Err("Некорректная часть речи словоформы".into());
+    let mut shared_lists = 0;
+    let mut clauses = 0;
+    for data in blocks {
+        let mut cursor = 0;
+        let mut previous = Vec::new();
+        let mut cache: [Option<CachedList>; 7] = std::array::from_fn(|_| None);
+        // Front is most recent; a new explicit list replaces the back slot.
+        let mut recency: Vec<usize> = (0..7).collect();
+        while cursor < data.len() {
+            previous = front_string(data, &mut cursor, &previous)?;
+            let clause = decode_text(&previous)?;
+            if vowel_count(&clause) == 0 {
+                return Err(format!("Клаузула без ударной гласной: {clause:?}"));
             }
-            entries.push(Entry {
-                word: format!("{prefix}{clause}"),
-                stress: prefix_stress[index],
-                part_of_speech: PARTS_OF_SPEECH[pos].into(),
-            });
+            let mask = u16_at(data, cursor)?;
+            let count_flags = u16_at(data, cursor + 2)?;
+            cursor += 4;
+            if mask == 0 || mask & !0x3ff != 0 {
+                return Err("Неизвестные части речи в словаре".into());
+            }
+            let count = (count_flags & 0x1fff) as usize;
+            if count == 0 {
+                return Err("Пустой список словоформ".into());
+            }
+            if entries.len() + count > MAX_ENTRIES {
+                return Err("Число словоформ превышает ограничение импортёра".into());
+            }
+            let shared = (count_flags >> 13) as usize;
+            let slot = if shared != 0 {
+                let slot = shared - 1;
+                let list = cache[slot]
+                    .as_ref()
+                    .ok_or("Ссылка на незаполненный слот кэша словаря")?;
+                if list.mask != mask || list.references.len() != count {
+                    return Err("Общий список не совпал по длине или частям речи".into());
+                }
+                let position = recency
+                    .iter()
+                    .position(|index| *index == slot)
+                    .ok_or("Повреждена очередь кэша")?;
+                recency.remove(position);
+                shared_lists += 1;
+                slot
+            } else {
+                let width = if mask.count_ones() > 1 { 4 } else { 3 };
+                let encoded = data
+                    .get(cursor..cursor + count * width)
+                    .ok_or("Обрезанный список словоформ")?;
+                let mut references = Vec::with_capacity(count);
+                for reference in encoded.chunks_exact(width) {
+                    let packed = reference[0] as usize
+                        | (reference[1] as usize) << 8
+                        | (reference[2] as usize) << 16;
+                    let prefix = packed & 0xfffff;
+                    let pos = if width == 4 {
+                        reference[3] as usize
+                    } else {
+                        mask.trailing_zeros() as usize
+                    };
+                    if prefix >= prefixes.len() {
+                        return Err("Ссылка на отсутствующую основу".into());
+                    }
+                    if pos >= PARTS_OF_SPEECH.len() || mask & (1 << pos) == 0 {
+                        return Err("Некорректная часть речи словоформы".into());
+                    }
+                    references.push(Reference { prefix, pos });
+                }
+                cursor += count * width;
+                let slot = recency.pop().ok_or("Пустая очередь кэша")?;
+                cache[slot] = Some(CachedList { mask, references });
+                slot
+            };
+            recency.insert(0, slot);
+            let list = cache[slot].as_ref().ok_or("Слот кэша не заполнен")?;
+            for reference in &list.references {
+                entries.push(Entry {
+                    word: format!("{}{clause}", prefixes[reference.prefix]),
+                    stress: prefix_stress[reference.prefix],
+                    part_of_speech: PARTS_OF_SPEECH[reference.pos].into(),
+                });
+            }
+            clauses += 1;
         }
-        cursor += count * width;
     }
-    Ok((entries, skipped_lists, skipped_forms))
+    Ok((entries, shared_lists, clauses))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn append_record(
+        block: &mut Vec<u8>,
+        clause: &str,
+        mask: u16,
+        count: u16,
+        shared_slot: Option<u16>,
+        references: &[(usize, usize)],
+    ) {
+        let (encoded, _, errors) = WINDOWS_1251.encode(clause);
+        assert!(!errors);
+        block.extend_from_slice(&encoded);
+        block.push(0);
+        block.extend_from_slice(&mask.to_le_bytes());
+        let flags = count | shared_slot.map_or(0, |slot| (slot + 1) << 13);
+        block.extend_from_slice(&flags.to_le_bytes());
+        if shared_slot.is_none() {
+            for (prefix, pos) in references {
+                let packed = *prefix as u32 | 8 << 20;
+                block.extend_from_slice(&packed.to_le_bytes()[..3]);
+                if mask.count_ones() > 1 {
+                    block.push(*pos as u8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_lists_preserve_recency_and_mixed_parts_of_speech() {
+        let prefixes = vec!["".into(), "к".into(), "т".into()];
+        let mut block = Vec::new();
+        append_record(&mut block, "от", 1, 1, None, &[(1, 0)]); // slot 6
+        append_record(&mut block, "ок", 1, 1, None, &[(2, 0)]); // slot 5
+        append_record(&mut block, "отик", 1, 1, Some(6), &[]); // touch slot 6
+        for clause in ["а", "ба", "ва", "га", "да", "жа"] {
+            append_record(&mut block, clause, 1, 1, None, &[(2, 0)]);
+        }
+        // Touching slot 6 must protect it from the sixth subsequent insertion.
+        append_record(&mut block, "ота", 1, 1, Some(6), &[]);
+        let (entries, shared, clauses) = read_clauses(&[block], &prefixes).unwrap();
+        assert_eq!(shared, 2);
+        assert_eq!(clauses, 10);
+        assert_eq!(entries.last().unwrap().word, "кота");
+        assert_eq!(entries[2].word, "котик");
+
+        let mut block = Vec::new();
+        append_record(&mut block, "от", 17, 2, None, &[(1, 0), (2, 4)]);
+        append_record(&mut block, "ота", 17, 2, Some(6), &[]);
+        let (entries, shared, _) = read_clauses(&[block], &prefixes).unwrap();
+        assert_eq!(shared, 1);
+        assert_eq!(entries[2].part_of_speech, "существительное");
+        assert_eq!(entries[3].part_of_speech, "глагол");
+    }
+
+    #[test]
+    fn shared_lists_reject_uninitialized_mismatched_and_cross_block_references() {
+        let prefixes = vec!["".into()];
+        let mut explicit = Vec::new();
+        append_record(&mut explicit, "а", 1, 1, None, &[(0, 0)]);
+        let mut shared = Vec::new();
+        append_record(&mut shared, "я", 1, 1, Some(6), &[]);
+        assert!(read_clauses(&[shared.clone()], &prefixes).is_err());
+        assert!(read_clauses(&[explicit.clone(), shared], &prefixes).is_err());
+        for (mask, count) in [(1, 2), (2, 1)] {
+            let mut block = explicit.clone();
+            append_record(&mut block, "я", mask, count, Some(6), &[]);
+            assert!(read_clauses(&[block], &prefixes).is_err());
+        }
+        let mut invalid = Vec::new();
+        append_record(&mut invalid, "а", 1, 1, None, &[(99, 0)]);
+        assert!(read_clauses(&[invalid], &prefixes).is_err());
+    }
 
     #[test]
     fn front_coding_copies_both_ends() {
@@ -361,7 +501,8 @@ mod tests {
     #[ignore = "requires the user's local Rhymes installation; no dictionary is distributed"]
     fn local_dictionary_contains_required_forms_and_stresses() {
         let lexicon = Lexicon::load_rhymes(Path::new("Rhymes 3")).unwrap();
-        assert!(lexicon.source.contains("частичный импорт"));
+        assert!(lexicon.source.contains("168634 общих списков"));
+        assert_eq!(lexicon.entries.len(), 3_139_098);
         assert!(lexicon.entries.len() > 2_000_000);
         for (word, stress, pos) in [
             ("спеша", 1, "деепричастие"),
@@ -369,6 +510,7 @@ mod tests {
             ("гаража", 2, "существительное"),
             ("замок", 0, "существительное"),
             ("замок", 1, "существительное"),
+            ("Уайльд", 1, "имя собственное"),
         ] {
             assert!(
                 lexicon

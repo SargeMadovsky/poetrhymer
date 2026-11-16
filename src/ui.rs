@@ -1173,7 +1173,7 @@ impl eframe::App for PoetApp {
                         } else if let Some(lexicon) = &self.lexicon {
                             ui.label(
                                 RichText::new(format!(
-                                    "Rhymes · частичный импорт · {} записей",
+                                    "Rhymes · {} записей",
                                     format_count(lexicon.entries.len())
                                 ))
                                 .size(11.0)
