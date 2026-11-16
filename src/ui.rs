@@ -74,6 +74,7 @@ pub struct PoetApp {
     update_available: Option<crate::updater::Manifest>,
     update_message: String,
     show_updates: bool,
+    updates_button_rect: Option<egui::Rect>,
     smoke_test: bool,
     smoke_stage: u8,
     smoke_started: Instant,
@@ -89,11 +90,20 @@ impl PoetApp {
             storage::load_recovery()
         };
         let recovered = recovery.is_some();
-        let default_folder = storage::app_directory().join("Rhymes 3");
-        let session = recovery.unwrap_or_else(|| storage::Session {
+        let default_folder = storage::default_dictionary_folder();
+        let mut session = recovery.unwrap_or_else(|| storage::Session {
             text: SAMPLE.to_owned(),
             dictionary_folder: default_folder.to_string_lossy().into_owned(),
         });
+        let saved_folder = PathBuf::from(&session.dictionary_folder);
+        let legacy_default = storage::app_directory().join("Rhymes 3");
+        if session.dictionary_folder.trim().is_empty()
+            || (saved_folder == legacy_default
+                && !saved_folder.join("rus_rhymes.dic").is_file()
+                && default_folder.join("rus_rhymes.dic").is_file())
+        {
+            session.dictionary_folder = default_folder.to_string_lossy().into_owned();
+        }
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             saved_text: if recovered {
@@ -142,6 +152,7 @@ impl PoetApp {
             update_available: None,
             update_message: String::new(),
             show_updates: false,
+            updates_button_rect: None,
             smoke_test,
             smoke_stage: 0,
             smoke_started: Instant::now(),
@@ -177,7 +188,19 @@ impl PoetApp {
             return;
         }
         let mut open = true;
-        egui::Window::new("Обновления Poetrhymer").open(&mut open).default_width(440.0).show(ctx, |ui| {
+        let position = self
+            .updates_button_rect
+            .map(|rect| rect.right_bottom() + egui::vec2(0.0, 8.0))
+            .unwrap_or_else(|| ctx.screen_rect().right_top() + egui::vec2(-20.0, 55.0));
+        egui::Window::new("Обновления Poetrhymer")
+            .open(&mut open)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(position)
+            .constrain_to(ctx.screen_rect())
+            .default_width(300.0)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
             ui.label(format!("Текущая версия: {}", env!("CARGO_PKG_VERSION")));
             ui.label(&self.update_message);
             if self.update_busy { ui.spinner(); }
@@ -536,8 +559,10 @@ impl PoetApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(12.0);
-                        if ui.button("Обновления").clicked() {
-                            self.show_updates = true;
+                        let updates_button = ui.button("Обновления");
+                        self.updates_button_rect = Some(updates_button.rect);
+                        if updates_button.clicked() {
+                            self.show_updates = !self.show_updates;
                         }
                         if ui.button("Словарь").clicked() {
                             self.show_dictionary = !self.show_dictionary;
@@ -954,9 +979,15 @@ impl PoetApp {
             }
         } else if self.smoke_stage == 1 && !self.search_loading && self.search_due.is_none() {
             self.chosen = self.candidates.iter().position(|c| c.word == "багажа");
+            if std::env::args().any(|arg| arg == "--smoke-updates") {
+                self.show_updates = true;
+                self.update_message = "Установлена актуальная версия".into();
+            }
             self.set_status("Проверено: словарь, поиск, замена, отмена и повтор.", false);
+            self.smoke_started = Instant::now();
             self.smoke_stage = 2;
-        } else if self.smoke_stage == 2 {
+        } else if self.smoke_stage == 2 && self.smoke_started.elapsed() > Duration::from_millis(400)
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.smoke_stage = 3;
         } else if self.smoke_stage == 3 {

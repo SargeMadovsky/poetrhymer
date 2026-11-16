@@ -10,6 +10,13 @@ pub struct Session {
     pub dictionary_folder: String,
 }
 
+pub fn default_dictionary_folder() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(app_directory)
+        .join("Rhymes 3")
+}
+
 pub fn app_directory() -> PathBuf {
     let executable = std::env::current_exe().ok();
     if let Some(parent) = executable.as_deref().and_then(Path::parent) {
