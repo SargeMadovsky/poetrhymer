@@ -277,7 +277,7 @@ fn normalized(word: &str) -> String {
         .collect()
 }
 
-fn explicit_stress(word: &str) -> Option<usize> {
+pub(crate) fn explicit_stress(word: &str) -> Option<usize> {
     let mut count = 0usize;
     for c in word.chars() {
         if is_vowel(c) {

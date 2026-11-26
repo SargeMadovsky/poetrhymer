@@ -946,7 +946,9 @@ impl PoetApp {
             return;
         }
         let ticket = self.search_ticket;
-        let anchor = self.anchor.trim().to_owned();
+        let anchor = self.anchor.trim();
+        let anchor = saved_anchor_stress(&self.text, self.anchor_line, anchor, &self.stress_marks)
+            .map_or_else(|| anchor.to_owned(), |vowel| core::with_stress(anchor, vowel));
         let filter = core::SearchFilter {
             syllables: self.match_syllables.then_some(self.syllable_count),
             part_of_speech: (!self.part_of_speech.is_empty()).then(|| self.part_of_speech.clone()),
@@ -1512,12 +1514,15 @@ impl PoetApp {
             let unaccented: String = self.anchor.chars().filter(|c| *c != '\u{301}').collect();
             let mut stress_choice = None;
             if stress::needs_mark(&unaccented) {
+                let selected_stress = core::explicit_stress(&self.anchor).or_else(|| {
+                    saved_anchor_stress(&self.text, self.anchor_line, self.anchor.trim(), &self.stress_marks)
+                });
                 let known = stress::dictionary_choices(&unaccented, self.lexicon.as_deref());
                 if !known.is_empty() {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Ударение из словаря:").small().color(MUTED));
                         for index in known {
-                            if stress_option(ui, &unaccented, index, false, true, true).clicked() {
+                            if stress_option(ui, &unaccented, index, selected_stress == Some(index), true, true).clicked() {
                                 stress_choice = Some(index);
                             }
                         }
@@ -1525,7 +1530,7 @@ impl PoetApp {
                 }
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Вручную: двойной клик по гласной").small().color(MUTED));
-                    let (_, choice) = manual_stress_word(ui, &unaccented, None);
+                    let (_, choice) = manual_stress_word(ui, &unaccented, selected_stress);
                     if choice.is_some() { stress_choice = choice; }
                 });
             }
@@ -1797,6 +1802,7 @@ impl PoetApp {
             self.after_document_change("Изменение ударения в тексте");
         } else {
             self.schedule_stress();
+            self.schedule_search();
             self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
             self.record_revision("Ручное ударение");
         }
@@ -1812,6 +1818,7 @@ impl PoetApp {
         self.stress_marks.retain(|mark| mark.start != start);
         self.last_typing = None;
         self.schedule_stress();
+        self.schedule_search();
         self.autosave_due = Some(Instant::now() + Duration::from_millis(800));
         self.record_revision("Автоматическое ударение");
     }
@@ -3580,6 +3587,28 @@ fn paint_meter_deviations(
     }
 }
 
+fn saved_anchor_stress(
+    text: &str,
+    line: Option<usize>,
+    anchor: &str,
+    marks: &[stress::Mark],
+) -> Option<usize> {
+    let line = line?;
+    if marks.is_empty() || core::explicit_stress(anchor).is_some() {
+        return None;
+    }
+    let lines = core::parse_lines(text);
+    let span = lines.get(line)?.last_word.as_ref()?;
+    if &text[span.clone()] != anchor {
+        return None;
+    }
+    marks
+        .iter()
+        .find(|mark| mark.start == span.start && mark.word == anchor)
+        .and_then(|mark| mark.vowel)
+        .filter(|vowel| *vowel < core::syllables(anchor))
+}
+
 // One readable word with per-vowel hit testing; a single click never changes it.
 fn manual_stress_word(
     ui: &mut egui::Ui,
@@ -3999,6 +4028,36 @@ fn format_count(value: usize) -> String {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+
+    #[test]
+    fn rhyme_search_uses_the_saved_stress_of_the_anchor_occurrence() {
+        let text = "Я пил из кружки.\nМастер ведёт кружки.\nИ две старушки.";
+        let marks = [stress::Mark {
+            start: text.find("кружки").unwrap(),
+            word: "кружки".into(),
+            vowel: Some(0),
+        }];
+        let lexicon = Lexicon::from_entries(
+            [("кружки", 0), ("кружки", 1), ("ватрушки", 1), ("береги", 2)]
+                .into_iter()
+                .map(|(word, stress)| crate::lexicon::Entry {
+                    word: word.into(),
+                    stress,
+                    part_of_speech: String::new(),
+                })
+                .collect(),
+            "fixture".into(),
+        );
+        let vowel = saved_anchor_stress(text, Some(0), "кружки", &marks).unwrap();
+        let anchor = core::with_stress("кружки", vowel);
+        let candidates = core::search_rhymes(&lexicon, &anchor, &core::SearchFilter::default(), 10);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].word, "ватрушки");
+
+        assert_eq!(saved_anchor_stress(text, Some(1), "кружки", &marks), None);
+        assert_eq!(saved_anchor_stress(text, None, "кружки", &marks), None);
+        assert_eq!(saved_anchor_stress(text, Some(0), "кружки́", &marks), None);
+    }
 
     #[test]
     fn manual_stress_requires_double_click_on_a_vowel() {
