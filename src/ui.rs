@@ -1970,8 +1970,13 @@ impl PoetApp {
     }
 
     fn copy_stress(&mut self, ctx: &egui::Context) {
-        let Some(analysis) = &self.stress_analysis else {
-            return;
+        let analyzed;
+        let analysis = match self.stress_analysis.as_deref() {
+            Some(analysis) => analysis,
+            None => {
+                analyzed = stress::analyze(&self.text, &self.stress_marks, self.lexicon.as_deref());
+                &analyzed
+            }
         };
         let selected = self
             .poem_editor_id
@@ -2342,7 +2347,7 @@ impl PoetApp {
                         self.schedule_stress();
                         self.autosave_due=Some(Instant::now()+Duration::from_millis(800));
                     }
-                    if self.stress_mode && ui.add_enabled(self.stress_analysis.is_some(), egui::Button::new("Скопировать с ударениями").wrap_mode(egui::TextWrapMode::Extend)).on_hover_text("Копирует выделенный фрагмент, а без выделения — весь текст").clicked() { self.copy_stress(ctx); }
+                    if self.stress_mode && ui.add_enabled(self.stress_analysis.is_some(), egui::Button::new("Скопировать с ударениями").wrap_mode(egui::TextWrapMode::Extend)).on_hover_text("Копирует выделенный фрагмент, а без выделения — весь текст. В редакторе также работает Ctrl+C.").clicked() { self.copy_stress(ctx); }
                     if !self.stress_mode && !self.meter_mode && ui.available_rect_before_wrap().width() > 300.0 {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(RichText::new("Последние слова — точки для новых рифм").size(12.0).color(MUTED));
@@ -2397,8 +2402,15 @@ impl PoetApp {
                     ctx.input_mut(|input| input.events.push(egui::Event::Paste(draft.into())));
                     self.smoke_stage += 1;
                 }
+                let editor_focused = ui.memory(|memory| memory.has_focus(editor_id));
+                let copy_with_stress = self.stress_mode && editor_focused && self.pending_action.is_none()
+                    && ctx.input_mut(|input| {
+                        let previous_len = input.events.len();
+                        input.events.retain(|event| !matches!(event, egui::Event::Copy));
+                        input.events.len() < previous_len
+                    });
                 let mut pasted = false;
-                if ui.memory(|memory| memory.has_focus(editor_id)) {
+                if editor_focused {
                     let range = egui::TextEdit::load_state(ctx, editor_id)
                         .and_then(|state| state.cursor.char_range())
                         .map(|range| range.primary.index.min(range.secondary.index)..range.primary.index.max(range.secondary.index));
@@ -2529,6 +2541,9 @@ impl PoetApp {
                     }
                     self.last_typing = if pasted { None } else { Some(now) };
                     self.after_document_change("Набор / вставка");
+                }
+                if copy_with_stress {
+                    self.copy_stress(ctx);
                 }
                 if let Some(character) = clicked_position {
                     self.last_typing = None;
@@ -3067,9 +3082,42 @@ impl PoetApp {
                     return;
                 }
             }
-            original_state.store(ctx, editor);
             if !exported.contains("замо́к") || self.text.contains('\u{301}') {
                 finish(ctx, Err("stress export/source mismatch".into()));
+                return;
+            }
+            let mut state = original_state;
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(start),
+                egui::text::CCursor::new(start + "замок".chars().count()),
+            )));
+            state.store(ctx, editor);
+            ctx.memory_mut(|memory| memory.request_focus(editor));
+            self.smoke_stage = 22;
+        } else if matches!(self.smoke_stage, 22 | 23) {
+            let mut copied = Vec::new();
+            ctx.output_mut(|output| {
+                output.commands.retain(|command| {
+                    if let egui::OutputCommand::CopyText(text) = command {
+                        copied.push(text.clone());
+                        return false;
+                    }
+                    true
+                });
+            });
+            let expected = if self.smoke_stage == 22 {
+                "замо́к".to_owned()
+            } else {
+                stress::export(&self.text, self.stress_analysis.as_deref().unwrap())
+            };
+            if copied != [expected] {
+                finish(ctx, Err("Ctrl+C with stresses copied the wrong text".into()));
+                return;
+            }
+            if self.smoke_stage == 22 {
+                self.requested_cursor = Some(0);
+                self.smoke_stage = 23;
+                ctx.request_repaint();
                 return;
             }
             let Some(entry) = self.history_entries.iter().find(|entry| {
@@ -3496,6 +3544,9 @@ impl eframe::App for PoetApp {
             });
         self.outline(ctx);
         self.rhyme_panel(ctx);
+        if self.smoke_test && matches!(self.smoke_stage, 22 | 23) {
+            ctx.input_mut(|input| input.events.push(egui::Event::Copy));
+        }
         self.editor(ctx);
         if open_stress {
             self.open_stress_at_cursor(ctx);
