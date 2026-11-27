@@ -74,6 +74,24 @@ pub fn default_dictionary_folder() -> PathBuf {
         .join("Rhymes 3")
 }
 
+pub fn find_dictionary_folder(preferred: &Path) -> Option<PathBuf> {
+    let installed_folders = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|root| !root.is_empty())
+        .map(|root| PathBuf::from(root).join("Rhymes 3"));
+    [
+        preferred.to_owned(),
+        default_dictionary_folder(),
+        app_directory().join("Rhymes 3"),
+    ]
+    .into_iter()
+    .chain(installed_folders)
+    .find(|folder| {
+        !folder.as_os_str().is_empty() && folder.join(crate::lexicon::RHYMES_FILE).is_file()
+    })
+}
+
 pub fn app_directory() -> PathBuf {
     let executable = std::env::current_exe().ok();
     if let Some(parent) = executable.as_deref().and_then(Path::parent) {

@@ -8,6 +8,8 @@ use std::{collections::HashMap, fs, io::Read, path::Path};
 use encoding_rs::WINDOWS_1251;
 use flate2::read::ZlibDecoder;
 
+pub const RHYMES_FILE: &str = "rus_rhymes.dic";
+
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub word: String,
@@ -83,9 +85,15 @@ impl Lexicon {
     }
 
     pub fn load_rhymes(folder: &Path) -> Result<Self, String> {
-        let path = folder.join("rus_rhymes.dic");
+        let path = folder.join(RHYMES_FILE);
         let size = fs::metadata(&path)
-            .map_err(|e| format!("Не удалось открыть {}: {e}", path.display()))?
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("Файл {RHYMES_FILE} не найден в указанной папке.")
+                } else {
+                    format!("Не удалось открыть {}: {e}", path.display())
+                }
+            })?
             .len();
         if size > MAX_FILE as u64 {
             return Err("Словарь слишком большой для этого прототипа".into());

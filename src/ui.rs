@@ -20,6 +20,8 @@ const FORMATTED_DRAFT: &str =
 const ACCENT: Color32 = Color32::from_rgb(238, 185, 104);
 const MUTED: Color32 = Color32::from_rgb(142, 156, 176);
 const INK: Color32 = Color32::from_rgb(222, 230, 241);
+const RHYMES_WEBSITE: &str = "https://rifmovnik.ru/";
+const RHYMES_DOWNLOAD: &str = "https://rifmovnik.ru/files/3/rhymes-3.7-setup.exe";
 
 struct Selection {
     span: Range<usize>,
@@ -192,13 +194,10 @@ impl PoetApp {
                 }
                 Err(error) => (None, history::new_document(), fallback_path, Some(error)),
             };
-        let saved_folder = PathBuf::from(&session.dictionary_folder);
-        let legacy_default = storage::app_directory().join("Rhymes 3");
-        if session.dictionary_folder.trim().is_empty()
-            || (saved_folder == legacy_default
-                && !saved_folder.join("rus_rhymes.dic").is_file()
-                && default_folder.join("rus_rhymes.dic").is_file())
-        {
+        let saved_folder = std::path::Path::new(session.dictionary_folder.trim());
+        if let Some(folder) = storage::find_dictionary_folder(saved_folder) {
+            session.dictionary_folder = folder.to_string_lossy().into_owned();
+        } else if saved_folder.as_os_str().is_empty() {
             session.dictionary_folder = default_folder.to_string_lossy().into_owned();
         }
         let (tx, rx) = mpsc::channel();
@@ -1480,6 +1479,11 @@ impl PoetApp {
             ui.add_space(6.0);
             let Some(selection) = &self.selection else {
                 ui.add_space(32.0);
+                if self.dictionary_error.is_some() {
+                    ui.label("Для подбора рифм подключите словарь Rhymes 3.");
+                    if ui.button("Подключить словарь").clicked() { self.show_dictionary = true; }
+                    return;
+                }
                 ui.label(RichText::new("Начните с последнего слова").size(18.0).color(ACCENT));
                 ui.add_space(10.0);
                 ui.label("Нажмите на подсвеченное слово в конце строки. Здесь появятся варианты замены.");
@@ -1529,7 +1533,7 @@ impl PoetApp {
                     });
                 }
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Вручную: двойной клик по гласной").small().color(MUTED));
+                    ui.label(RichText::new("Вручную: нажмите на гласную").small().color(MUTED));
                     let (_, choice) = manual_stress_word(ui, &unaccented, selected_stress);
                     if choice.is_some() { stress_choice = choice; }
                 });
@@ -1592,7 +1596,7 @@ impl PoetApp {
                 ui.horizontal(|ui| { ui.spinner(); ui.label("Подготавливаем словарь Rhymes…"); });
             } else if self.dictionary_error.is_some() {
                 ui.colored_label(Color32::LIGHT_RED, "Словарь не подключён");
-                if ui.button("Выбрать папку Rhymes").clicked() { self.show_dictionary = true; }
+                if ui.button("Подключить словарь").clicked() { self.show_dictionary = true; }
             } else if self.anchor.trim().is_empty() {
                 ui.label(RichText::new("Выберите строку-опору или введите слово.").color(MUTED));
             } else if self.search_loading || self.search_due.is_some() {
@@ -1935,7 +1939,7 @@ impl PoetApp {
                     );
                 }
                 if token.choices.is_empty() {
-                    ui.label("Словарных вариантов нет. Укажите ударение двойным кликом по гласной в слове сверху.");
+                    ui.label("Словарных вариантов нет.");
                 } else {
                     ui.label("Из словаря Rhymes:");
                     self.word_stress_options(ui, ctx, &token, &token.choices);
@@ -1959,7 +1963,7 @@ impl PoetApp {
                         self.close_stress_popup(ctx);
                     }
                 });
-                ui.label(RichText::new("Двойной клик по гласной сверху — вручную · Esc — закрыть").small().color(MUTED));
+                ui.label(RichText::new("Нажмите на гласную сверху · Esc — закрыть").small().color(MUTED));
             });
         if !open {
             self.stress_selected = None;
@@ -2563,9 +2567,27 @@ impl PoetApp {
         }
         let mut open = true;
         egui::Window::new("Локальный словарь").open(&mut open).default_width(520.0).collapsible(false).show(ctx, |ui| {
-            ui.label("Укажите папку вашей копии Rhymes. Словарь читается только на этом компьютере.");
+            if self.lexicon.is_none() && !self.dictionary_loading {
+                ui.label("Rhymes 3 даёт редактору словарь рифм и ударений. Скачайте и установите Rhymes 3, затем нажмите «Найти словарь».");
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to("Скачать Rhymes 3 для Windows", RHYMES_DOWNLOAD);
+                    ui.hyperlink_to("Официальный сайт", RHYMES_WEBSITE);
+                });
+                if ui.button("Найти словарь").clicked() {
+                    let preferred = std::path::Path::new(self.dictionary_folder.trim());
+                    if let Some(folder) = storage::find_dictionary_folder(preferred) {
+                        self.dictionary_folder = folder.to_string_lossy().into_owned();
+                        self.load_dictionary(ctx);
+                    } else {
+                        self.dictionary_error = Some("Файл rus_rhymes.dic не найден в обычных папках установки.".into());
+                    }
+                }
+                ui.add_space(8.0);
+                ui.separator();
+            }
+            ui.label("Для подключения вручную выберите папку с файлом rus_rhymes.dic и нажмите «Подключить».");
             ui.add_space(12.0);
-            ui.add(egui::TextEdit::singleline(&mut self.dictionary_folder).desired_width(f32::INFINITY).hint_text("Папка Rhymes 3"));
+            ui.add(egui::TextEdit::singleline(&mut self.dictionary_folder).desired_width(f32::INFINITY).hint_text("Папка с файлом rus_rhymes.dic"));
             ui.horizontal(|ui| {
                 if ui.button("Выбрать папку…").clicked() {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -3660,7 +3682,7 @@ fn saved_anchor_stress(
         .filter(|vowel| *vowel < core::syllables(anchor))
 }
 
-// One readable word with per-vowel hit testing; a single click never changes it.
+// Keep the word intact while making each vowel a separate click target.
 fn manual_stress_word(
     ui: &mut egui::Ui,
     word: &str,
@@ -3670,10 +3692,10 @@ fn manual_stress_word(
     let galley = ui.fonts(|fonts| fonts.layout_no_wrap(clean, FontId::proportional(20.0), INK));
     let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::click());
     ui.painter().galley(rect.min, galley.clone(), INK);
-    let pointer = ui
-        .ctx()
-        .input(|input| input.pointer.hover_pos())
-        .filter(|_| response.hovered());
+    let pointer = response.hover_pos();
+    let click = response
+        .interact_pointer_pos()
+        .filter(|_| response.clicked_by(egui::PointerButton::Primary));
     let mut vowel = 0;
     let mut choice = None;
     for row in &galley.rows {
@@ -3692,16 +3714,17 @@ fn manual_stress_word(
             }
             if pointer.is_some_and(|point| bounds.contains(point)) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                let underline = bounds.bottom() - 1.0;
                 ui.painter().line_segment(
-                    [bounds.left_bottom(), bounds.right_bottom()],
-                    Stroke::new(1.0_f32, ACCENT),
+                    [
+                        egui::pos2(bounds.left(), underline),
+                        egui::pos2(bounds.right(), underline),
+                    ],
+                    Stroke::new(2.0_f32, ACCENT),
                 );
-                response
-                    .clone()
-                    .on_hover_text("Двойной клик — поставить ударение на эту гласную вручную");
-                if response.double_clicked() {
-                    choice = Some(vowel);
-                }
+            }
+            if click.is_some_and(|point| bounds.contains(point)) {
+                choice = Some(vowel);
             }
             vowel += 1;
         }
@@ -4111,8 +4134,8 @@ mod navigation_tests {
     }
 
     #[test]
-    fn manual_stress_requires_double_click_on_a_vowel() {
-        for (character, expected) in [(5, Some(2)), (2, None)] {
+    fn manual_stress_uses_a_single_click_on_a_vowel() {
+        for (character, expected) in [(1, Some(0)), (3, Some(1)), (5, Some(2)), (2, None)] {
             let ctx = egui::Context::default();
             let mut time = 0.0;
             let mut run = |events: Vec<egui::Event>| {
@@ -4151,23 +4174,15 @@ mod navigation_tests {
             let (target, _, _) = run(vec![]);
             let (_, choice, cursor) = run(vec![egui::Event::PointerMoved(target)]);
             assert!(choice.is_none());
-            if expected.is_some() {
-                assert_eq!(cursor, egui::CursorIcon::PointingHand);
-            }
-            for click in 0..2 {
-                for pressed in [true, false] {
-                    let (_, choice, _) = run(vec![egui::Event::PointerButton {
-                        pos: target,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    }]);
-                    if click == 0 || pressed {
-                        assert!(choice.is_none());
-                    } else {
-                        assert_eq!(choice, expected);
-                    }
-                }
+            assert_eq!(cursor == egui::CursorIcon::PointingHand, expected.is_some());
+            for pressed in [true, false] {
+                let (_, choice, _) = run(vec![egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+                assert_eq!(choice, if pressed { None } else { expected });
             }
         }
     }

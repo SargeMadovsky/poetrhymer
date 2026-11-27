@@ -1,4 +1,4 @@
-#ifndef AppVersion
+﻿#ifndef AppVersion
   #define AppVersion "0.1.1"
 #endif
 [Setup]
@@ -25,6 +25,9 @@ SetupIconFile=..\assets\icon\poetrhymer.ico
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
+[CustomMessages]
+english.DownloadRhymes=Open the Rhymes 3 download page (rhyme dictionary)
+russian.DownloadRhymes=Открыть страницу скачивания Rhymes 3 (словарь рифм)
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 [Files]
@@ -35,4 +38,5 @@ Source: "THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{autoprograms}\Poetrhymer"; Filename: "{app}\Poetrhymer.exe"
 Name: "{autodesktop}\Poetrhymer"; Filename: "{app}\Poetrhymer.exe"; Tasks: desktopicon
 [Run]
+Filename: "https://rifmovnik.ru/"; Description: "{cm:DownloadRhymes}"; Flags: postinstall shellexec nowait skipifsilent unchecked
 Filename: "{app}\Poetrhymer.exe"; Description: "{cm:LaunchProgram,Poetrhymer}"; Flags: nowait postinstall skipifsilent
