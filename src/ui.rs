@@ -947,7 +947,10 @@ impl PoetApp {
         let ticket = self.search_ticket;
         let anchor = self.anchor.trim();
         let anchor = saved_anchor_stress(&self.text, self.anchor_line, anchor, &self.stress_marks)
-            .map_or_else(|| anchor.to_owned(), |vowel| core::with_stress(anchor, vowel));
+            .map_or_else(
+                || anchor.to_owned(),
+                |vowel| core::with_stress(anchor, vowel),
+            );
         let filter = core::SearchFilter {
             syllables: self.match_syllables.then_some(self.syllable_count),
             part_of_speech: (!self.part_of_speech.is_empty()).then(|| self.part_of_speech.clone()),
@@ -1943,7 +1946,10 @@ impl PoetApp {
                 } else {
                     ui.label("Из словаря Rhymes:");
                     self.word_stress_options(ui, ctx, &token, &token.choices);
-                    if token.selected.is_some_and(|vowel| !token.choices.contains(&vowel)) {
+                    if token
+                        .selected
+                        .is_some_and(|vowel| !token.choices.contains(&vowel))
+                    {
                         ui.label("Текущий ручной выбор отсутствует в словаре.");
                     }
                 }
@@ -1963,7 +1969,11 @@ impl PoetApp {
                         self.close_stress_popup(ctx);
                     }
                 });
-                ui.label(RichText::new("Нажмите на гласную сверху · Esc — закрыть").small().color(MUTED));
+                ui.label(
+                    RichText::new("Нажмите на гласную сверху · Esc — закрыть")
+                        .small()
+                        .color(MUTED),
+                );
             });
         if !open {
             self.stress_selected = None;
@@ -3109,10 +3119,12 @@ impl PoetApp {
                 return;
             }
             let mut state = original_state;
-            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                egui::text::CCursor::new(start),
-                egui::text::CCursor::new(start + "замок".chars().count()),
-            )));
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(start),
+                    egui::text::CCursor::new(start + "замок".chars().count()),
+                )));
             state.store(ctx, editor);
             ctx.memory_mut(|memory| memory.request_focus(editor));
             self.smoke_stage = 22;
@@ -3133,7 +3145,10 @@ impl PoetApp {
                 stress::export(&self.text, self.stress_analysis.as_deref().unwrap())
             };
             if copied != [expected] {
-                finish(ctx, Err("Ctrl+C with stresses copied the wrong text".into()));
+                finish(
+                    ctx,
+                    Err("Ctrl+C with stresses copied the wrong text".into()),
+                );
                 return;
             }
             if self.smoke_stage == 22 {
